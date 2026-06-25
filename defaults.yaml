@@ -1,0 +1,150 @@
+# =============================================
+# 规划中心框架默认配置
+# 所有参数集中在此，便于统一管理和调优
+# =============================================
+
+features:
+  # 9个原始相似度特征（查询侧只传这9个）
+  raw_features:
+    - 吨煤产气量
+    - 主汽压力
+    - 炉膛差压
+    - 一次风流量
+    - 床温
+    - 料层差压
+    - 锅炉出口氧量
+    - 二次风风量
+    - 热值
+
+  # 6个残差目标（模块内部用 .joblib 模型计算 resid_ 列）
+  residual_targets:
+    - 炉膛差压
+    - 床温
+    - 料层差压
+    - 锅炉出口氧量
+    - 一次风流量
+    - 二次风风量
+
+  # 3个残差模型输入（主汽流量在此作为X，但相似度权重为0）
+  residual_inputs:
+    - 主汽流量
+    - 主汽压力
+    - 吨煤产气量
+
+  # 原始特征权重（主汽流量=0硬门控，热值=0占位）
+  weights:
+    主汽流量: 0.00
+    吨煤产气量: 0.40
+    主汽压力: 0.50
+    炉膛差压: 0.40
+    一次风流量: 0.25
+    床温: 0.30
+    料层差压: 0.20
+    锅炉出口氧量: 0.20
+    二次风风量: 0.35
+    热值: 0.00
+
+  # 残差特征权重 = 对应原始权重 × ratio（默认0.5）
+  residual_weight_ratio: 0.5
+
+  # 列别名映射（用于不同数据源的列名对齐）
+  column_aliases:
+    吨煤产汽量（2h）: 吨煤产气量
+
+  # 输出的控制变量列（不含热值、不含残差）
+  plan_center_cols:
+    - 主汽流量
+    - 主汽压力
+    - 炉膛差压
+    - 一次风流量
+    - 床温
+    - 料层差压
+    - 锅炉出口氧量
+    - 二次风风量
+
+  load_col: 主汽流量
+  eff_col: 锅炉效率
+  heat_value_col: 热值
+
+matching:
+  # D = a*S + b*E（无频次分F）
+  d_weight_s: 1.0    # a（相似度权重）
+  d_weight_e: 0.0    # b（效率权重）
+  top_k: 5
+  plan_center_mode: 2          # 1=最佳单样本, 2=Top-k加权均值
+  topk_avg_method: weighted    # "mean" | "weighted"
+  low_sim_fallback_threshold: 0.75
+  enable_low_sim_fallback: true
+  allow_fallback_nearest_load: false
+
+flow_gate:
+  # 主汽流量硬门控：偏差超阈值时相似度置0
+  enable: true
+  mode: absolute    # "absolute" | "relative"
+  abs_threshold: 30.0    # t/h（绝对偏差阈值）
+  rel_threshold: 0.05    # 相对偏差阈值（相对模式）
+
+continuity:
+  enable_rate_limit: false
+  rate_limit_features:
+    - 炉膛差压
+    - 一次风流量
+    - 床温
+    - 料层差压
+    - 锅炉出口氧量
+    - 二次风风量
+  rate_limit_abs:
+    炉膛差压: 50.0
+    一次风流量: 2.0
+    床温: 3.0
+    料层差压: 50.0
+    锅炉出口氧量: 0.30
+    二次风风量: 1.0
+  reset_on_time_gap: true
+  max_gap_minutes: 5.0
+
+paths:
+  # 实际数据路径
+  stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
+  residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
+  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数
+  query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
+  cache_path: null    # null=不缓存
+
+train:
+  # 残差特征训练配置
+  input_parquet: "D:/redian/vectorsearch/#4_final_stable_df_mean_3_4_02.parquet"    # 输入：稳定工况原始数据
+  output_dir: "D:/redian/vectorsearch/plan_center/output"                            # 输出目录
+
+  # 合理工况筛选（可开关）
+  enable_filter: true
+  filter_cols:
+    - 炉膛差压
+    - 一次风流量
+    - 床温
+    - 料层差压
+    - 锅炉出口氧量
+  filter_q_low: 0.02
+  filter_q_high: 0.98
+  filter_n_bins: 15
+  filter_max_bad_features: 2
+
+  # 分层抽样（可开关）
+  enable_stratified_split: true
+  train_ratio: 0.70
+  valid_ratio: 0.15
+  test_ratio: 0.15
+
+  # 残差模型
+  oof_n_splits: 5
+
+  # 残差模型参数（HistGradientBoostingRegressor）
+  residual_model_params:
+    max_iter: 200
+    learning_rate: 0.05
+    max_depth: 6
+    min_samples_leaf: 20
+    l2_regularization: 1.0
+    random_state: 42
+
+time_col: null    # null=自动识别时间列
