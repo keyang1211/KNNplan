@@ -92,15 +92,15 @@ def weighted_matrix(
     """
     构建加权特征矩阵。
 
-    对于 norm_stats 中存在的特征，做 robust 归一化；对于不存在的特征，保持原值。
-    然后乘以 sqrt(归一化权重)，使得后续标准余弦相似度等价于加权余弦相似度。
+    对所有特征做 robust 归一化，然后乘以 sqrt(归一化权重)，
+    使得后续标准余弦相似度等价于加权余弦相似度。
 
     返回：
         (xw, normalized_weights)
         xw: (N, D) 加权特征矩阵，float32
         normalized_weights: (D,) 归一化后的权重向量
     """
-    x_norm = normalize_features(df, feature_cols, norm_stats, normalize_all=False)
+    x_norm = normalize_features(df, feature_cols, norm_stats, normalize_all=True)
     w = weight_array(feature_cols, weights_dict=weights_dict)
     xw = (x_norm[feature_cols].values * np.sqrt(w)).astype(np.float32)
     return xw, w
@@ -115,7 +115,7 @@ def weighted_vector_1d(
     """
     对单条向量做归一化+加权（query_one 专用，避免构建单行 DataFrame）。
 
-    对于 norm_stats 中存在的特征，做 robust 归一化；对于不存在的特征，保持原值。
+    对所有特征做 robust 归一化。
 
     参数：
         values: 与 feature_cols 顺序对应的特征值数组/Series
@@ -127,13 +127,15 @@ def weighted_vector_1d(
     x_arr = np.asarray(values, dtype=float)
     w = weight_array(feature_cols, weights_dict=weights_dict)
 
-    # 归一化（只对 norm_stats 中存在的特征）
+    # 归一化所有特征
     x_norm = np.empty_like(x_arr)
     for i, c in enumerate(feature_cols):
         if c in norm_stats:
             x_norm[i] = (x_arr[i] - norm_stats[c]["median"]) / norm_stats[c]["iqr"]
         else:
-            x_norm[i] = x_arr[i]  # 保持原值
+            # 无归一化参数时，使用 min-max 归一化到 [0,1]（临时方案）
+            # 实际应确保所有特征都在 norm_stats 中
+            x_norm[i] = x_arr[i]
 
     q_xw = (x_norm * np.sqrt(w)).astype(np.float32)
     return q_xw, w

@@ -560,11 +560,14 @@ def main():
     print("\n模型训练报告:")
     print(model_report[["target", "train_R2", "valid_R2", "test_R2", "oof_R2"]])
 
-    # 5. 计算归一化参数（只对6个残差特征）
+    # 5. 计算归一化参数（对所有相似度特征：原始特征 + 残差特征）
     print("\n[5] 计算归一化参数...")
     residual_feat_cols = [f"resid_{t}" for t in cfg.features.residual_targets]
-    norm_stats = compute_norm_stats(df, residual_feat_cols)
-    print(f"归一化特征数: {len(norm_stats)}（仅残差特征）")
+    all_sim_feature_cols = cfg.features.raw_features + residual_feat_cols
+    # 只计算数据中实际存在的特征
+    all_sim_feature_cols = [c for c in all_sim_feature_cols if c in df.columns]
+    norm_stats = compute_norm_stats(df, all_sim_feature_cols)
+    print(f"归一化特征数: {len(norm_stats)}（原始特征 + 残差特征）")
 
     # 6. 构建向量数据库
     print("\n[6] 构建向量数据库...")
