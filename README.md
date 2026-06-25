@@ -46,7 +46,7 @@ paths:
 如果拿到的是**原始稳定工况数据**（无resid_*列），需要先运行训练：
 
 ```bash
-python plan_center/train_residual.py
+python -m plan_center.train_residual
 ```
 
 **输入**：稳定工况parquet（只有原始特征 + 效率）
@@ -117,7 +117,7 @@ df_out = run_batch(
 ### D. 可视化验证（1天连续数据）
 
 ```bash
-python plan_center/validate_visual.py
+python -m plan_center.validate_visual
 ```
 
 **输出**：`validate_visual_1day.html`，包含7个子图（实际值 vs 规划值）：
