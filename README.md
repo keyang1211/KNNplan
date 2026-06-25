@@ -16,7 +16,8 @@ plan_center/
 ├── batch.py                 # 批量驱动 run_batch()：逐行查询 + parquet输出
 ├── schemas.py               # 列名前缀常量 + PlanResult dataclass
 ├── train_residual.py        # 残差特征训练模块（训练 + 归一化参数 + 向量数据库）
-└── validate_visual.py       # 7天连续数据可视化
+├── run_once.py              # 单次查询示例：输出 Top-K 结果到 CSV
+└── validate_visual.py       # 1天连续数据可视化
 ```
 
 ## 快速开始
@@ -53,7 +54,7 @@ python -m plan_center.train_residual
 **输出**：
 - `vector_db.parquet` — 向量数据库（原始特征 + resid_* + 效率）
 - `residual_models/` — 6个残差模型（.joblib）
-- `norm_stats.json` — 归一化参数
+- `norm_stats.json` — 归一化参数（所有相似度特征：原始 + 残差）
 - `model_report.csv` / `residual_report.csv` — 训练报告
 
 **配置**（defaults.yaml → train段）：
@@ -76,7 +77,7 @@ engine = PlanningEngine("defaults.yaml")
 
 result = engine.plan_one(
     raw_features={
-        "主汽流量": 250.0, "主汽压力": 13.0, "吨煤产汽平均值": 7.3,
+        "主汽流量": 250.0, "主汽压力": 13.0, "吨煤产气量": 7.3,
         "炉膛差压": 800.0, "一次风流量": 140000, "床温": 880.0,
         "料层差压": 6.3, "锅炉出口氧量": 4.6, "二次风风量": 57.0,
         "热值": 5000.0,
@@ -91,7 +92,20 @@ print(result.match_status)       # 匹配状态
 print(result.similarity_best)    # 最佳相似度
 ```
 
-### C. 批量查询（读取parquet，逐行查询，输出parquet）
+### C. 单次查询输出 Top-K 到 CSV
+
+```bash
+# 默认查询第0行，输出 Top-5
+python -m plan_center.run_once
+
+# 指定行号和输出路径
+python -m plan_center.run_once --row-index 100 --output result.csv
+
+# 指定 Top-10
+python -m plan_center.run_once --top-k 10
+```
+
+### D. 批量查询（读取parquet，逐行查询，输出parquet）
 
 ```python
 from plan_center import PlanningEngine, run_batch
@@ -114,20 +128,20 @@ df_out = run_batch(
 - 连续性诊断：连续性处理状态、限幅触发特征等
 - 回退诊断：低相似度回退、规划中心来源
 
-### D. 可视化验证（1天连续数据）
+### E. 可视化验证（1天连续数据）
 
 ```bash
 python -m plan_center.validate_visual
 ```
 
-**输出**：`validate_visual_1day.html`，包含7个子图（实际值 vs 规划值）：
-- 主汽流量（负荷）
-- 床温
-- 一次风流量
-- 料层差压
-- 炉膛差压
-- 锅炉出口氧量
-- 匹配度（相似度S）
+**输出**：`validate_visual_1day.html`，包含8个子图：
+- 主汽流量（负荷）：实际值 vs 规划值
+- 床温：实际值 vs 规划值
+- 一次风流量：实际值 vs 规划值
+- 料层差压：实际值 vs 规划值
+- 炉膛差压：实际值 vs 规划值
+- 锅炉出口氧量：实际值 vs 规划值
+- 相似度S / 匹配度D：Best + TopK均值对比
 
 ## 配置参数说明
 
@@ -143,15 +157,20 @@ python -m plan_center.validate_visual
 ### matching（匹配配置）
 - `d_weight_s` / `d_weight_e`：D = a*S + b*E 中的权重
 - `top_k`：Top-k数量（默认5）
-- `low_sim_fallback_threshold`：低相似度回退阈值（默认0.97）
+- `plan_center_mode`：1=最佳单样本，2=Top-k加权均值
+- `topk_avg_method`：mean（算术平均）或 weighted（加权平均）
+- `low_sim_fallback_threshold`：低相似度回退阈值（默认0.75）
+- `enable_low_sim_fallback`：是否启用低相似度回退
 
 ### flow_gate（硬门控）
 - `enable`：是否启用主汽流量硬门控
 - `mode`：absolute（绝对偏差）或 relative（相对偏差）
-- `abs_threshold`：绝对偏差阈值（默认30.0 t/h）
+- `abs_threshold`：绝对偏差阈值（默认15.0 t/h）
 
 ### continuity（连续性）
 - `enable_rate_limit`：是否启用变化率限幅
+- `rate_limit_features`：需要限幅的特征列表
+- `rate_limit_abs`：各特征的绝对变化率阈值
 - `reset_on_time_gap`：时间间隔过大时是否重置
 - `max_gap_minutes`：最大间隔分钟数（默认5）
 
@@ -159,6 +178,8 @@ python -m plan_center.validate_visual
 - `enable_filter`：合理工况筛选开关
 - `filter_cols`：筛选特征列表
 - `enable_stratified_split`：分层抽样开关
+- `oof_n_splits`：OOF 折数（默认5）
+- `residual_model_params`：HistGradientBoostingRegressor 参数
 
 ## 数据流
 
@@ -175,3 +196,12 @@ python -m plan_center.validate_visual
     ↓
 [continuity.py] 连续性处理 → 最终规划中心
 ```
+
+## 归一化说明
+
+所有相似度特征（原始特征 + 残差特征）均做 robust 归一化：
+```
+z = (x - median) / IQR
+```
+
+归一化参数在训练时计算并保存到 `norm_stats.json`，推理时加载使用。

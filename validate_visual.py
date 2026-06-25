@@ -282,6 +282,15 @@ def main():
     df_query = pd.read_parquet(query_parquet)
     print(f"    查询数据形状: {df_query.shape}")
 
+    # 应用列别名映射
+    aliases = engine.cfg.features.column_aliases
+    if aliases:
+        for old, new in aliases.items():
+            if old in df_query.columns and new not in df_query.columns:
+                df_query[new] = df_query[old]
+            elif old in df_query.columns and new in df_query.columns:
+                df_query = df_query.drop(columns=[old])
+
     # 3. 随机选取连续1天数据
     print("\n[3] 随机选取连续1天数据...")
     time_col = engine.cfg.time_col or "时间"

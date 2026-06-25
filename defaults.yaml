@@ -48,6 +48,7 @@ features:
   residual_weight_ratio: 0.5
 
   # 列别名映射（用于不同数据源的列名对齐）
+  # 查询数据中的列名会被映射为标准样本中的列名
   column_aliases:
     吨煤产汽量（2h）: 吨煤产气量
 
@@ -68,8 +69,10 @@ features:
 
 matching:
   # D = a*S + b*E（无频次分F）
-  d_weight_s: 0.5    # a（相似度权重）
-  d_weight_e: 0.5   # b（效率权重）
+  # S = 加权余弦相似度（所有特征均做 robust 归一化）
+  # E = 效率分位数（0~1）
+  d_weight_s: 0.8    # a（相似度权重）
+  d_weight_e: 0.2    # b（效率权重）
   top_k: 5
   plan_center_mode: 2          # 1=最佳单样本, 2=Top-k加权均值
   topk_avg_method: weighted    # "mean" | "weighted"
@@ -81,7 +84,7 @@ flow_gate:
   # 主汽流量硬门控：偏差超阈值时相似度置0
   enable: true
   mode: absolute    # "absolute" | "relative"
-  abs_threshold: 30.0    # t/h（绝对偏差阈值）
+  abs_threshold: 15.0    # t/h（绝对偏差阈值）
   rel_threshold: 0.05    # 相对偏差阈值（相对模式）
 
 continuity:
@@ -107,7 +110,7 @@ paths:
   # 实际数据路径
   stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
   residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
-  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数
+  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数（所有相似度特征）
   query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
   cache_path: null    # null=不缓存
 
