@@ -15,7 +15,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1) -> pd.DataFrame:
+def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1, max_retries: int = 20) -> pd.DataFrame:
     """
     从 df 中随机选取连续N天数据。
 
@@ -23,6 +23,7 @@ def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1) -> pd.Da
         df: 分钟级查询数据
         time_col: 时间列名
         days: 天数（默认1天）
+        max_retries: 最大重试次数（避免选到空区间）
 
     返回：
         连续N天的子集 DataFrame
@@ -39,18 +40,34 @@ def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1) -> pd.Da
     if total_minutes < target_minutes:
         raise ValueError(f"数据不足{days}天，只有 {total_minutes / 60 / 24:.1f} 天")
 
-    # 随机选起始时间
+    # 随机选起始时间，重试直到选到非空区间
     max_start_minutes = total_minutes - target_minutes
-    start_offset = np.random.randint(0, int(max_start_minutes))
-    start_time = t_min + pd.Timedelta(minutes=start_offset)
-    end_time = start_time + pd.Timedelta(minutes=target_minutes)
+    for attempt in range(max_retries):
+        start_offset = np.random.randint(0, int(max_start_minutes))
+        start_time = t_min + pd.Timedelta(minutes=start_offset)
+        end_time = start_time + pd.Timedelta(minutes=target_minutes)
 
+        mask = (df[time_col] >= start_time) & (df[time_col] < end_time)
+        df_selected = df.loc[mask].reset_index(drop=True)
+
+        if len(df_selected) > 0:
+            print(f"选取的{days}天时间范围: {start_time} ~ {end_time}")
+            print(f"总分钟数: {len(df_selected)}")
+            return df_selected
+
+    # 所有重试都为空，回退：取数据最密集的连续N天窗口
+    print(f"警告: 随机选取{max_retries}次均为空区间，改用最密集窗口")
+    # 按小时分桶，找数据量最大的起始小时
+    df_h = df.set_index(time_col).resample("1h").size()
+    if df_h.sum() == 0:
+        raise ValueError("数据全为空，无法选取")
+    best_hour = df_h.rolling(window=max(1, int(target_minutes / 60)), min_periods=1).sum().idxmax()
+    start_time = pd.Timestamp(best_hour)
+    end_time = start_time + pd.Timedelta(minutes=target_minutes)
     mask = (df[time_col] >= start_time) & (df[time_col] < end_time)
     df_selected = df.loc[mask].reset_index(drop=True)
-
     print(f"选取的{days}天时间范围: {start_time} ~ {end_time}")
     print(f"总分钟数: {len(df_selected)}")
-
     return df_selected
 
 
@@ -112,17 +129,21 @@ def run_validation(engine, df_7days: pd.DataFrame, time_col: str) -> list:
 
 def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
     """
-    画7个子图：实际值 vs 规划值。
+    画8个子图：实际值 vs 规划值 + S/D 对比。
 
     参数：
         df_out: 输出 DataFrame（含原始数据 + 规划中心 + 诊断）
         time_col: 时间列名
         output_path: HTML 输出路径
     """
+    if len(df_out) == 0:
+        print("数据为空，跳过绘图")
+        return
+
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
 
-    # 7个特征
+    # 8个子图：实际值 vs 规划值
     features = [
         ("主汽流量（负荷）", "主汽流量"),
         ("床温", "床温"),
@@ -130,25 +151,17 @@ def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
         ("料层差压", "料层差压"),
         ("炉膛差压", "炉膛差压"),
         ("锅炉出口氧量", "锅炉出口氧量"),
-        ("匹配度（相似度S）", None),  # 特殊处理
     ]
 
     fig = make_subplots(
-        rows=7, cols=1,
-        subplot_titles=[f[0] for f in features],
-        vertical_spacing=0.05,
+        rows=8, cols=1,
+        subplot_titles=[f[0] for f in features] + ["相似度S / 匹配度D"],
+        vertical_spacing=0.04,
     )
 
     for i, (name, col) in enumerate(features, start=1):
-        if col is None:
-            # 匹配度（相似度S）
-            actual = df_out["相似度S"]
-            planned = df_out["TopK_S均值"]
-            y_title = "相似度"
-        else:
-            actual = df_out[col]
-            planned = df_out[f"规划中心_{col}"]
-            y_title = col
+        actual = df_out[col]
+        planned = df_out[f"规划中心_{col}"]
 
         # 实际值（蓝色实线）
         fig.add_trace(
@@ -178,12 +191,60 @@ def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
             row=i, col=1,
         )
 
-        fig.update_yaxes(title_text=y_title, row=i, col=1)
+        fig.update_yaxes(title_text=name, row=i, col=1)
 
-    fig.update_xaxes(title_text="时间", row=7, col=1)
+    # 第8个子图：S 和 D
+    row_sd = len(features) + 1
+    fig.add_trace(
+        go.Scatter(
+            x=df_out[time_col],
+            y=df_out["相似度S"],
+            mode="lines",
+            name="相似度S（Best）",
+            line=dict(color="green", width=1),
+            legendgroup="sim",
+        ),
+        row=row_sd, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df_out[time_col],
+            y=df_out["TopK_S均值"],
+            mode="lines",
+            name="相似度S（TopK均值）",
+            line=dict(color="green", width=1, dash="dot"),
+            legendgroup="sim",
+        ),
+        row=row_sd, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df_out[time_col],
+            y=df_out["匹配度D"],
+            mode="lines",
+            name="匹配度D（Best）",
+            line=dict(color="orange", width=1),
+            legendgroup="score_d",
+        ),
+        row=row_sd, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df_out[time_col],
+            y=df_out["TopK_D均值"],
+            mode="lines",
+            name="匹配度D（TopK均值）",
+            line=dict(color="orange", width=1, dash="dot"),
+            legendgroup="score_d",
+        ),
+        row=row_sd, col=1,
+    )
+    fig.update_yaxes(title_text="S / D", row=row_sd, col=1)
+
+    fig.update_xaxes(title_text="时间", row=row_sd, col=1)
     fig.update_layout(
         title="规划中心验证：实际值 vs 规划值（连续1天）",
-        height=1800,
+        height=2000,
         width=1400,
         legend=dict(x=0.01, y=0.99),
         font=dict(family="SimHei, Microsoft YaHei, Arial"),
@@ -240,6 +301,10 @@ def main():
         plan_center_cols=engine.cfg.features.plan_center_cols,
     )
     print(f"    输出形状: {df_out.shape}")
+
+    if len(df_out) == 0:
+        print("\n警告: 选取的数据为空，跳过可视化")
+        return
 
     # 6. 可视化
     print("\n[6] 生成可视化...")

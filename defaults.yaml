@@ -68,8 +68,8 @@ features:
 
 matching:
   # D = a*S + b*E（无频次分F）
-  d_weight_s: 1.0    # a（相似度权重）
-  d_weight_e: 0.0    # b（效率权重）
+  d_weight_s: 0.5    # a（相似度权重）
+  d_weight_e: 0.5   # b（效率权重）
   top_k: 5
   plan_center_mode: 2          # 1=最佳单样本, 2=Top-k加权均值
   topk_avg_method: weighted    # "mean" | "weighted"
