@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-validate_visual.py — 验证脚本：7天连续数据可视化
+validate_visual.py — 验证脚本：连续数据可视化
 
-从分钟级查询数据中随机选取连续7天，逐分钟调用规划中心，
-将实际值与规划值对比可视化。
+从分钟级查询数据中随机选取或按指定时间范围选取连续若干天，
+逐分钟调用规划中心，将实际值与规划值对比可视化。
+
+用法:
+    python -m plan_center.validate_visual                         # 随机1天
+    python -m plan_center.validate_visual --days 3                # 随机3天
+    python -m plan_center.validate_visual --seed 42               # 随机1天（固定种子，可复现）
+    python -m plan_center.validate_visual --start 2025-03-01 --end 2025-03-02   # 指定范围
+    python -m plan_center.validate_visual --output result.html    # 指定输出路径
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,7 +23,34 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1, max_retries: int = 20) -> pd.DataFrame:
+def select_time_range(df: pd.DataFrame, time_col: str, start_str: str, end_str: str) -> pd.DataFrame:
+    """
+    按指定起止时间切取数据。
+
+    参数：
+        df: 分钟级查询数据
+        time_col: 时间列名
+        start_str: 起始时间字符串（如 "2025-03-01" 或 "2025-03-01 10:00"）
+        end_str: 终止时间字符串（含，精确到分钟）
+
+    返回：
+        指定时间范围的子集 DataFrame
+    """
+    start_time = pd.Timestamp(start_str)
+    end_time = pd.Timestamp(end_str)
+
+    mask = (df[time_col] >= start_time) & (df[time_col] <= end_time)
+    df_selected = df.loc[mask].sort_values(time_col).reset_index(drop=True)
+
+    if len(df_selected) == 0:
+        raise ValueError(f"指定时间范围内无数据: {start_time} ~ {end_time}")
+
+    print(f"指定时间范围: {start_time} ~ {end_time}")
+    print(f"总分钟数: {len(df_selected)}")
+    return df_selected
+
+
+def select_random_days(df: pd.DataFrame, time_col: str, days: int = 1, max_retries: int = 20) -> pd.DataFrame:
     """
     从 df 中随机选取连续N天数据。
 
@@ -51,7 +86,7 @@ def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1, max_retr
         df_selected = df.loc[mask].reset_index(drop=True)
 
         if len(df_selected) > 0:
-            print(f"选取的{days}天时间范围: {start_time} ~ {end_time}")
+            print(f"随机选取的{days}天时间范围: {start_time} ~ {end_time}")
             print(f"总分钟数: {len(df_selected)}")
             return df_selected
 
@@ -66,7 +101,7 @@ def select_random_7days(df: pd.DataFrame, time_col: str, days: int = 1, max_retr
     end_time = start_time + pd.Timedelta(minutes=target_minutes)
     mask = (df[time_col] >= start_time) & (df[time_col] < end_time)
     df_selected = df.loc[mask].reset_index(drop=True)
-    print(f"选取的{days}天时间范围: {start_time} ~ {end_time}")
+    print(f"随机选取的{days}天时间范围: {start_time} ~ {end_time}")
     print(f"总分钟数: {len(df_selected)}")
     return df_selected
 
@@ -127,7 +162,7 @@ def run_validation(engine, df_7days: pd.DataFrame, time_col: str) -> list:
     return results
 
 
-def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
+def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str, title: str = "规划中心验证：实际值 vs 规划值"):
     """
     画8个子图：实际值 vs 规划值 + S/D 对比。
 
@@ -135,6 +170,7 @@ def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
         df_out: 输出 DataFrame（含原始数据 + 规划中心 + 诊断）
         time_col: 时间列名
         output_path: HTML 输出路径
+        title: 图标题
     """
     if len(df_out) == 0:
         print("数据为空，跳过绘图")
@@ -243,7 +279,7 @@ def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
 
     fig.update_xaxes(title_text="时间", row=row_sd, col=1)
     fig.update_layout(
-        title="规划中心验证：实际值 vs 规划值（连续1天）",
+        title=title,
         height=2000,
         width=1400,
         legend=dict(x=0.01, y=0.99),
@@ -255,17 +291,32 @@ def plot_validation(df_out: pd.DataFrame, time_col: str, output_path: str):
 
 
 def main():
-    print("=== 验证脚本：7天连续数据可视化 ===\n")
+    parser = argparse.ArgumentParser(description="规划中心验证：实际值 vs 规划值可视化")
+    parser.add_argument("--start", type=str, default=None,
+                        help="起始时间（如 '2025-03-01' 或 '2025-03-01 10:00'），与 --end 配合使用")
+    parser.add_argument("--end", type=str, default=None,
+                        help="终止时间（如 '2025-03-02' 或 '2025-03-02 10:00'），与 --start 配合使用")
+    parser.add_argument("--days", type=int, default=1,
+                        help="随机模式下选取的天数（默认 1；--start/--end 指定时忽略此参数）")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="随机种子，固定后可复现（仅随机模式有效）")
+    parser.add_argument("--output", type=str, default=None,
+                        help="输出 HTML 路径（默认按时间范围自动命名）")
+    parser.add_argument("--config", type=str, default=None,
+                        help="配置文件路径（默认 defaults.yaml）")
+    args = parser.parse_args()
+
+    use_specified_range = bool(args.start and args.end)
+
+    print("=== 验证脚本：连续数据可视化 ===\n")
 
     # 1. 加载配置 + 构建引擎
     print("[1] 加载 PlanningEngine...")
     from plan_center import PlanningEngine
 
-    # 使用默认配置（需要用户修改 defaults.yaml 中的路径）
-    config_path = Path(__file__).parent / "defaults.yaml"
+    config_path = Path(args.config) if args.config else Path(__file__).parent / "defaults.yaml"
     if not config_path.exists():
         print(f"错误: 配置文件不存在 {config_path}")
-        print("请先修改 defaults.yaml 中的路径配置")
         sys.exit(1)
 
     engine = PlanningEngine(str(config_path))
@@ -276,7 +327,6 @@ def main():
     query_parquet = engine.cfg.paths.query_parquet
     if not query_parquet or not Path(query_parquet).exists():
         print(f"错误: 查询数据路径不存在 {query_parquet}")
-        print("请在 defaults.yaml 中设置 paths.query_parquet")
         sys.exit(1)
 
     df_query = pd.read_parquet(query_parquet)
@@ -291,21 +341,37 @@ def main():
             elif old in df_query.columns and new in df_query.columns:
                 df_query = df_query.drop(columns=[old])
 
-    # 3. 随机选取连续1天数据
-    print("\n[3] 随机选取连续1天数据...")
     time_col = engine.cfg.time_col or "时间"
-    df_7days = select_random_7days(df_query, time_col, days=1)
+
+    # 3. 选取数据
+    if use_specified_range:
+        print(f"\n[3] 按指定时间范围选取数据: {args.start} ~ {args.end}")
+        df_selected = select_time_range(df_query, time_col, args.start, args.end)
+        start_label = pd.Timestamp(args.start).strftime("%Y-%m-%d")
+        end_label = pd.Timestamp(args.end).strftime("%Y-%m-%d")
+        range_str = f"{start_label}_to_{end_label}"
+        title = f"规划中心验证：实际值 vs 规划值（{args.start} ~ {args.end}）"
+    else:
+        print(f"\n[3] 随机选取连续{args.days}天数据...")
+        if args.seed is not None:
+            np.random.seed(args.seed)
+            print(f"    随机种子: {args.seed}")
+        df_selected = select_random_days(df_query, time_col, days=args.days)
+        t_start = df_selected[time_col].min()
+        t_end = df_selected[time_col].max()
+        range_str = f"{t_start.strftime('%Y-%m-%d')}_{args.days}days"
+        title = f"规划中心验证：实际值 vs 规划值（随机{args.days}天，{t_start.strftime('%Y-%m-%d %H:%M')} ~ {t_end.strftime('%Y-%m-%d %H:%M')}）"
 
     # 4. 逐分钟调用 plan_one
     print("\n[4] 逐分钟调用 plan_one...")
-    results = run_validation(engine, df_7days, time_col)
+    results = run_validation(engine, df_selected, time_col)
 
     # 5. 构建输出 DataFrame
     print("\n[5] 构建输出 DataFrame...")
     from plan_center.schemas import build_output_dataframe
 
     df_out = build_output_dataframe(
-        raw_df=df_7days,
+        raw_df=df_selected,
         results=results,
         plan_center_cols=engine.cfg.features.plan_center_cols,
     )
@@ -317,10 +383,16 @@ def main():
 
     # 6. 可视化
     print("\n[6] 生成可视化...")
-    output_path = Path(__file__).parent / "validate_visual_1day.html"
-    plot_validation(df_out, time_col, str(output_path))
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        output_path = Path(__file__).parent / f"validate_{range_str}.html"
+
+    plot_validation(df_out, time_col, str(output_path), title=title)
 
     print("\n=== 验证完成 ===")
+    print(f"时间范围: {df_selected[time_col].min()} ~ {df_selected[time_col].max()}")
+    print(f"输出文件: {output_path}")
 
 
 if __name__ == "__main__":

@@ -62,6 +62,10 @@ def main():
                 df_query = df_query.drop(columns=[old])
         row = df_query.iloc[args.row_index]
 
+    # 提取时间（用于输出）
+    time_col = engine.cfg.time_col or "时间"
+    input_time = row.get(time_col, None)
+
     raw_features = {}
     for c in engine.cfg.features.raw_features:
         raw_features[c] = float(row.get(c, 0.0))
@@ -73,6 +77,8 @@ def main():
     print("    查询特征:")
     for k, v in raw_features.items():
         print(f"      {k}: {v:.4f}")
+    if input_time is not None:
+        print(f"    查询时间: {input_time}")
 
     # 4. 单次查询（不含连续性）
     print(f"\n[4] 执行查询 (Top-{args.top_k})...")
@@ -132,6 +138,12 @@ def main():
     out_df["匹配度D"] = top_d
     out_df["效率分位数E"] = top_e
 
+    # 在每行前面插入本次输入的详细信息（重复 Top-K 行数次，保持表格矩形）
+    out_df.insert(0, "输入_行号", args.row_index)
+    out_df.insert(1, "输入_时间", str(input_time) if input_time is not None else "")
+    for i, (feat_name, feat_val) in enumerate(raw_features.items()):
+        out_df.insert(2 + i, f"输入_{feat_name}", feat_val)
+
     # 6. 保存
     out_path = Path(args.output)
     out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
@@ -140,6 +152,8 @@ def main():
     # 打印摘要
     print(f"\n{'='*60}")
     print(f"查询行: {args.row_index}")
+    if input_time is not None:
+        print(f"查询时间: {input_time}")
     print(f"匹配状态: {result.match_status}")
     print(f"Top-{args.top_k} 结果:")
     print(f"{'='*60}")

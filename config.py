@@ -97,6 +97,20 @@ class TrainConfig:
 
 
 @dataclass(frozen=True)
+class OptimizeConfig:
+    learning_rate: float
+    num_epochs: int
+    batch_days: int
+    fd_step: float
+    random_seed: int
+    max_weight: float
+    loss_feature_weights: dict[str, float]
+    disable_fallback_during_opt: bool
+    report_csv: str
+    report_json: str
+
+
+@dataclass(frozen=True)
 class PlanningConfig:
     features: FeatureConfig
     matching: MatchingConfig
@@ -105,6 +119,7 @@ class PlanningConfig:
     paths: PathsConfig
     filter: FilterConfig | None = None
     train: TrainConfig | None = None
+    optimize: OptimizeConfig | None = None
     time_col: str | None = None
 
 
@@ -226,6 +241,23 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
 
     time_col = cfg.get("time_col", None)
 
+    # 解析 optimize 配置（可选）
+    opt_raw = cfg.get("optimize", {})
+    opt_cfg = None
+    if opt_raw:
+        opt_cfg = OptimizeConfig(
+            learning_rate=float(opt_raw.get("learning_rate", 0.05)),
+            num_epochs=int(opt_raw.get("num_epochs", 20)),
+            batch_days=int(opt_raw.get("batch_days", 5)),
+            fd_step=float(opt_raw.get("fd_step", 1e-3)),
+            random_seed=int(opt_raw.get("random_seed", 42)),
+            max_weight=float(opt_raw.get("max_weight", 5.0)),
+            loss_feature_weights={k: float(v) for k, v in opt_raw.get("loss_feature_weights", {}).items()},
+            disable_fallback_during_opt=bool(opt_raw.get("disable_fallback_during_opt", True)),
+            report_csv=str(opt_raw.get("report_csv", "optimize_report.csv")),
+            report_json=str(opt_raw.get("report_json", "optimize_report.json")),
+        )
+
     return PlanningConfig(
         features=features,
         matching=matching,
@@ -234,6 +266,7 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         filter=filter_cfg,
         paths=paths,
         train=train_cfg,
+        optimize=opt_cfg,
         time_col=time_col,
     )
 

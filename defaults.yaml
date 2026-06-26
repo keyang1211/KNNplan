@@ -151,3 +151,33 @@ train:
     random_state: 42
 
 time_col: null    # null=自动识别时间列
+
+# =============================================
+# 权重寻优配置
+# =============================================
+optimize:
+  # 数值梯度下降超参数
+  learning_rate: 0.05        # 梯度下降学习率
+  num_epochs: 20             # 训练轮次
+  batch_days: 5              # 每个 batch 的天数
+  fd_step: 1e-3              # 中心差分步长（相对权重和的比例，乘以当前权重和后作为扰动量）
+  random_seed: 42            # 随机种子（控制天切分的shuffle顺序）
+  max_weight: 5.0            # 权重上界（防止无限增大）
+
+  # loss 中各控制变量的权重（0=不参与loss）
+  # 主汽流量/热值固定为0（硬门控变量）
+  loss_feature_weights:
+    主汽压力: 1.0
+    炉膛差压: 1.0
+    一次风流量: 1.0
+    床温: 1.0
+    料层差压: 1.0
+    锅炉出口氧量: 0.6
+    二次风风量: 0.6
+
+  # 寻优期间强制关闭低相似度回退（避免优化器"作弊"靠回退降低误差）
+  disable_fallback_during_opt: true
+
+  # 输出报告路径（相对于 output_dir）
+  report_csv: "optimize_report.csv"
+  report_json: "optimize_report.json"

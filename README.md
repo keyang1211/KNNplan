@@ -16,8 +16,9 @@ plan_center/
 ├── batch.py                 # 批量驱动 run_batch()：逐行查询 + parquet输出
 ├── schemas.py               # 列名前缀常量 + PlanResult dataclass
 ├── train_residual.py        # 残差特征训练模块（训练 + 归一化参数 + 向量数据库）
-├── run_once.py              # 单次查询示例：输出 Top-K 结果到 CSV
-└── validate_visual.py       # 1天连续数据可视化
+├── run_once.py              # 单次查询示例：输出 Top-K 结果到 CSV（含输入信息）
+├── validate_visual.py       # 连续数据可视化（随机或指定时间范围）
+└── optimize_weights.py      # 权重梯度寻优（数值梯度下降）
 ```
 
 ## 快速开始
@@ -95,7 +96,7 @@ print(result.similarity_best)    # 最佳相似度
 ### C. 单次查询输出 Top-K 到 CSV
 
 ```bash
-# 默认查询第0行，输出 Top-5
+# 默认查询第0行，输出 Top-5（含输入特征）
 python -m plan_center.run_once
 
 # 指定行号和输出路径
@@ -104,6 +105,11 @@ python -m plan_center.run_once --row-index 100 --output result.csv
 # 指定 Top-10
 python -m plan_center.run_once --top-k 10
 ```
+
+**输出 CSV 列**：
+- 输入信息：`输入_行号`, `输入_时间`, `输入_<各特征>`（本次查询的实际值）
+- 排名 + 标准样本信息（原始特征 + 残差特征）
+- 诊断：相似度S、匹配度D、效率分位数E
 
 ### D. 批量查询（读取parquet，逐行查询，输出parquet）
 
@@ -128,20 +134,62 @@ df_out = run_batch(
 - 连续性诊断：连续性处理状态、限幅触发特征等
 - 回退诊断：低相似度回退、规划中心来源
 
-### E. 可视化验证（1天连续数据）
+### E. 可视化验证（连续数据）
 
 ```bash
+# 随机选取1天
 python -m plan_center.validate_visual
+
+# 随机选取3天（固定种子可复现）
+python -m plan_center.validate_visual --days 3 --seed 42
+
+# 指定时间范围
+python -m plan_center.validate_visual --start 2025-03-01 --end 2025-03-02
+
+# 指定输出路径
+python -m plan_center.validate_visual --output my_validation.html
 ```
 
-**输出**：`validate_visual_1day.html`，包含8个子图：
+**输出**：HTML 文件，包含8个子图（时间范围在文件名和标题中）：
 - 主汽流量（负荷）：实际值 vs 规划值
-- 床温：实际值 vs 规划值
-- 一次风流量：实际值 vs 规划值
-- 料层差压：实际值 vs 规划值
-- 炉膛差压：实际值 vs 规划值
-- 锅炉出口氧量：实际值 vs 规划值
+- 床温、一次风流量、料层差压、炉膛差压、锅炉出口氧量：实际值 vs 规划值
 - 相似度S / 匹配度D：Best + TopK均值对比
+
+### F. 相似度权重梯度寻优
+
+数值梯度下降自动寻优 8 个原始特征权重（残差权重自动绑定），最小化规划中心与实际控制值之间的 IQR 归一化加权 MSE。
+
+```bash
+# 使用默认配置运行寻优（约需 10-30 分钟取决于数据量）
+python -m plan_center.optimize_weights
+
+# 指定配置文件
+python -m plan_center.optimize_weights --config defaults.yaml
+```
+
+**输出**：
+- `output/optimize_report.csv`：每轮 epoch 的 loss 和权重
+- `output/optimize_report.json`：最优权重 + 基线对比 + 可直接粘贴进 defaults.yaml 的权重块
+
+**配置**（defaults.yaml → optimize段）：
+```yaml
+optimize:
+  learning_rate: 0.05        # 梯度下降学习率
+  num_epochs: 20             # 训练轮次
+  batch_days: 5              # 每个 batch 的天数
+  fd_step: 0.001             # 中心差分步长
+  random_seed: 42            # 随机种子
+  max_weight: 5.0            # 权重上界
+  loss_feature_weights:      # loss 中各变量的权重（0=不参与）
+    主汽压力: 1.0
+    炉膛差压: 1.0
+    一次风流量: 1.0
+    床温: 1.0
+    料层差压: 1.0
+    锅炉出口氧量: 0.6       # 低权重变量
+    二次风风量: 0.6
+  disable_fallback_during_opt: true  # 寻优期间关闭低相似度回退
+```
 
 ## 配置参数说明
 
@@ -180,6 +228,17 @@ python -m plan_center.validate_visual
 - `enable_stratified_split`：分层抽样开关
 - `oof_n_splits`：OOF 折数（默认5）
 - `residual_model_params`：HistGradientBoostingRegressor 参数
+
+### optimize（权重寻优配置，可选）
+- `learning_rate`：梯度下降学习率
+- `num_epochs`：训练轮次
+- `batch_days`：每个 batch 的天数
+- `fd_step`：中心差分步长（相对权重和的比例）
+- `random_seed`：随机种子（控制 shuffle 顺序和复现性）
+- `max_weight`：权重上界（防止无限增大）
+- `loss_feature_weights`：loss 中各控制变量的权重（0=不参与 loss）
+- `disable_fallback_during_opt`：寻优期间是否关闭低相似度回退（避免优化器"作弊"）
+- `report_csv` / `report_json`：输出报告文件名
 
 ## 数据流
 
