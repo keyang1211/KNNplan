@@ -413,6 +413,8 @@ def run_optimize(config_path=None):
 
     print(f"\n[4] 开始梯度下降（{opt.num_epochs} epoch，每 epoch {opt.batch_days} 天/batch）...")
 
+    global_batch_count = 0  # 全局 batch 计数器
+
     for epoch in range(opt.num_epochs):
         # shuffle 天顺序
         shuffled_days = rng.permutation(day_keys).tolist()
@@ -446,6 +448,12 @@ def run_optimize(config_path=None):
             current_weights = np.clip(current_weights, 0.0, max_w)
 
             batch_count += 1
+            global_batch_count += 1
+
+            # 每 100 个 batch 打印一次
+            if global_batch_count % 100 == 0:
+                print(f"    [Batch {global_batch_count}] loss={loss:.6f}  "
+                      + "  ".join(f"{n}={w:.4f}" for n, w in zip(opt_feature_names, current_weights)))
 
         epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else np.nan
         if epoch_loss < best_loss:
