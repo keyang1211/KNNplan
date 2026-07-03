@@ -37,7 +37,7 @@ features:
     吨煤产气量: 0.00
     主汽压力: 0.98
     炉膛差压: 0.50
-    一次风流量: 0.1
+    一次风流量: 0.49
     床温: 0.41
     料层差压: 0.57
     锅炉出口氧量: 0.42
@@ -75,7 +75,7 @@ matching:
   d_weight_s: 1.0    # a（相似度权重）
   d_weight_e: 0.0    # b（效率权重）
   top_k: 5
-  plan_center_mode: 1          # 1=最佳单样本, 2=Top-k加权均值
+  plan_center_mode: 2          # 1=最佳单样本, 2=Top-k加权均值
   topk_avg_method: weighted    # "mean" | "weighted"
   low_sim_fallback_threshold: 0.75
   enable_low_sim_fallback: true
@@ -111,7 +111,6 @@ paths:
   # 实际数据路径
   stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
   residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
-  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数（所有相似度特征）
   query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
   cache_path: null    # null=不缓存
 

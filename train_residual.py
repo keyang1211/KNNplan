@@ -10,8 +10,9 @@ train_residual.py — 残差特征训练模块
 3. 分层抽样（可开关）
 4. 训练残差模型（HistGradientBoostingRegressor）
 5. 5-fold OOF 生成残差
-6. 计算归一化参数（median/IQR）
-7. 保存输出（向量数据库、模型、归一化参数、报告）
+6. 保存输出（向量数据库、模型、报告）
+
+注意：归一化参数不再在训练阶段计算，改为查询时动态计算候选子集的统计量。
 """
 
 import json
@@ -486,7 +487,6 @@ def compute_norm_stats(
 def save_outputs(
     df_vector_db: pd.DataFrame,
     models: dict,
-    norm_stats: dict,
     model_report: pd.DataFrame,
     residual_report: pd.DataFrame,
     output_dir: str,
@@ -495,9 +495,10 @@ def save_outputs(
     保存输出：
     - vector_db.parquet
     - residual_model_*.joblib（6个）
-    - norm_stats.json（归一化参数）
     - residual_report.csv
     - model_report.csv
+
+    注意：归一化参数不再保存，改为查询时动态计算候选子集的统计量。
 
     返回输出路径字典。
     """
@@ -521,14 +522,7 @@ def save_outputs(
     paths["model_dir"] = str(model_dir)
     print(f"已保存残差模型: {model_dir}")
 
-    # 3. 归一化参数
-    norm_stats_path = output_dir / "norm_stats.json"
-    with open(norm_stats_path, "w", encoding="utf-8") as f:
-        json.dump(norm_stats, f, ensure_ascii=False, indent=2)
-    paths["norm_stats"] = str(norm_stats_path)
-    print(f"已保存归一化参数: {norm_stats_path}")
-
-    # 4. 训练报告
+    # 3. 训练报告
     model_report_path = output_dir / "model_report.csv"
     model_report.to_csv(model_report_path, index=False, encoding="utf-8-sig")
     paths["model_report"] = str(model_report_path)
@@ -618,15 +612,6 @@ def main():
     print("\n模型训练报告:")
     print(model_report[["target", "train_R2", "valid_R2", "test_R2", "oof_R2"]])
 
-    # 5. 计算归一化参数（对所有相似度特征：原始特征 + 残差特征）
-    print("\n[5] 计算归一化参数...")
-    residual_feat_cols = [f"resid_{t}" for t in cfg.features.residual_targets]
-    all_sim_feature_cols = cfg.features.raw_features + residual_feat_cols
-    # 只计算数据中实际存在的特征
-    all_sim_feature_cols = [c for c in all_sim_feature_cols if c in df.columns]
-    norm_stats = compute_norm_stats(df, all_sim_feature_cols)
-    print(f"归一化特征数: {len(norm_stats)}（原始特征 + 残差特征）")
-
     # 6. 构建向量数据库
     print("\n[6] 构建向量数据库...")
     # 保留原始特征 + 残差特征 + 效率 + 身份列 + 负荷列（硬门控）
@@ -646,7 +631,6 @@ def main():
     paths = save_outputs(
         df_vector_db,
         models,
-        norm_stats,
         model_report,
         residual_report,
         train_cfg.output_dir,
@@ -655,7 +639,6 @@ def main():
     print("\n=== 训练完成 ===")
     print(f"向量数据库: {paths['vector_db']}")
     print(f"残差模型: {paths['model_dir']}")
-    print(f"归一化参数: {paths['norm_stats']}")
 
 
 if __name__ == "__main__":
