@@ -16,6 +16,9 @@ plan_center/
 ├── batch.py                 # 批量驱动 run_batch()：逐行查询 + parquet输出
 ├── schemas.py               # 列名前缀常量 + PlanResult dataclass
 ├── train_residual.py        # 残差特征训练模块（训练 + 向量数据库，不计算归一化参数）
+├── dtw_query.py             # DTW 时序查询核心（独立查询路径）
+├── weight_comparison_eval_dtw.py  # DTW 评估脚本（同 weight_comparison_eval.py 功能）
+├── validate_visual_dtw.py   # DTW 可视化验证脚本（同 validate_visual.py 功能）
 ├── run_once.py              # 单次查询示例：输出 Top-K 结果到 CSV（含输入信息）
 ├── validate_visual.py       # 连续数据可视化（随机或指定时间范围）
 ├── run_10day_sample.py      # 批量随机采样查询：最后30天随机采样，输出 Top-5 详情
@@ -395,7 +398,251 @@ output_parquet
 
 ---
 
-### J. schemas.py — 数据结构
+### J. dtw_query.py — DTW 时序查询（新增）
+
+**职责**：基于时序相似度的独立查询路径，使用 DTW（动态时间规整）对齐 + 加权余弦相似度，从分钟级历史数据中匹配最相似的时序片段并输出规划中心。
+
+**与现有 PlanningEngine 的区别**：
+
+| 维度 | PlanningEngine（稳定工况点查询） | DTWQueryEngine（时序查询） |
+|------|----------------------------------|---------------------------|
+| 数据源 | `vector_db.parquet`（稳定工况，~9k行） | `#4_df_all_1min.parquet`（分钟级全量，~67万行） |
+| 查询向量 | 单点（15维：9原始+6残差） | 时序片段（5分钟×15维=15×5矩阵） |
+| 相似度计算 | 加权余弦 `(cos+1)/2` | DTW对齐后逐对加权余弦均值 |
+| 匹配方式 | Top-k 最近邻 | DTW最短路径 + Top-k |
+| 标准化 | 候选子集动态 median/IQR | 3天全局参考窗口 median/IQR |
+| 输出 | 规划中心 | 规划中心 |
+| 连续性处理 | 支持 | 暂不支持（独立查询路径） |
+
+**数据流**：
+
+```
+查询时间戳 t（如 "2025-06-29 00:06:00"）
+    │
+    ▼
+截取参考窗口 [t-3天, t]（约 4000~4500 条分钟数据）
+    │
+    ▼
+参考窗口全局 robust 归一化（median/IQR，基于 15 维特征）
+    │
+    ▼
+提取查询序列：参考窗口末尾 5 分钟（5个点，15×5 矩阵）
+    │
+    ▼
+构建候选池：参考窗口开头 ~ (末尾-5分钟)，滑动切分
+    │  └─ 长度 4/5/6 分钟三种，步长 1 分钟
+    │  └─ 约 12000~13000 个候选片段
+    │
+    ▼
+每个候选序列：DTW 对齐（5点 vs 4/5/6点）→ 逐对加权 cosine → 均值
+    │  └─ DTW 路径回溯（动态规划 O(n×m)，n≤6）
+    │  └─ cosine01 逐对计算（加权余弦映射到 [0,1]）
+    │
+    ▼
+argsort 降序 → Top-k（默认 k=5）
+    │
+    ▼
+规划中心：Top-k 片段末帧 plan_center_cols 加权均值
+    │
+    ▼
+PlanResult（同现有格式，match_status="DTW时序匹配"）
+```
+
+**DTW 算法说明**：
+
+```
+DTW 动态规划（numpy 手动实现，scipy 1.15.2 无 dtw 模块）：
+
+成本矩阵 D[i,j] = ||x[i] - y[j]||₂ + min(D[i-1,j], D[i,j-1], D[i-1,j-1])
+路径回溯：从 (n-1, m-1) 到 (0, 0)
+复杂度：O(n×m)，n≤6 时完全无压力
+```
+
+**相似度计算流程**：
+
+```
+DTW 对齐得到路径 pairs = [(i_q0, i_c0), (i_q1, i_c1), ...]
+    │
+    ▼
+逐对提取对齐点：q_aligned[k] vs c_aligned[k]
+    │
+    ▼
+每对单独计算 weighted cosine01 = (cosine_similarity + 1) / 2
+    │  └─ 特征已乘以 sqrt(权重)，标准 cosine 等价于加权 cosine
+    │
+    ▼
+取所有对的均值 → 序列相似度 [0, 1]
+```
+
+**残差缓存机制**：
+
+首次调用时自动生成残差缓存 `#4_df_all_1min_with_resid.parquet`（约 229MB）：
+1. 加载 `#4_df_all_1min.parquet`（674002×65）
+2. 列名别名映射（`吨煤产汽量（2h）` → `吨煤产气量`）
+3. 加载 6 个残差模型（`.joblib`）
+4. 全量 `model.predict()` 计算 `resid_*` 列
+5. 保存缓存（后续直接读取，约 10s → <1s）
+
+**关键函数**：
+
+| 函数 | 用途 |
+|------|------|
+| `dtw_align(query_seq, cand_seq)` | DTW 动态规划对齐，返回路径对和代价 |
+| `dtw_weighted_cosine_mean(query_seq, cand_seq, pairs)` | 对齐后逐对 cosine 均值 |
+| `slide_candidates(ref_df, ...)` | 滑窗切分候选序列 |
+| `ensure_resid_cache(...)` | 确保残差缓存存在（自动生成/读取） |
+| `query_dtw(query_ts, ref_df_resid, ...)` | DTW 查询主函数 |
+| `DTWQueryEngine` | 引擎类（懒加载 + query_one 接口） |
+
+**配置说明**（`defaults.yaml → dtw_query` 段）：
+
+```yaml
+dtw_query:
+  ref_days: 3              # 参考窗口：往前 N 天
+  query_seq_len: 5         # 查询序列长度（分钟）
+  dtw_min_len: 4           # 候选序列最短长度（分钟）
+  dtw_max_len: 6           # 候选序列最长长度（分钟）
+  slide_step: 1            # 滑动步长（分钟）
+  top_k: 5                 # Top-k 数量
+  resid_cache_parquet:     # 残差缓存路径
+    "D:/redian/vectorsearch/#4_df_all_1min_with_resid.parquet"
+  dtw_feature_weights:     # DTW 欧氏距离权重（与 similarity weights 一致）
+    主汽流量: 0.0
+    主汽压力: 0.98
+    炉膛差压: 0.50
+    ...
+```
+
+**使用方式**：
+
+```python
+from plan_center import load_config, DTWQueryEngine
+
+# 加载配置
+cfg = load_config()
+
+# 构建 DTW 查询引擎（首次会自动生成残差缓存，约 10s）
+engine = DTWQueryEngine(cfg)
+
+# 单次查询
+result = engine.query_one(query_ts="2025-06-29 00:06:00")
+
+# 访问结果
+print(result.final_plan_center)   # 规划中心（8个控制变量）
+print(result.similarity_best)     # 最佳序列相似度 [0,1]
+print(result.topk_indices)        # Top-K 候选起始索引
+print(result.match_status)        # "DTW时序匹配"
+```
+
+**注意事项**：
+- DTW 查询路径**完全独立**，不修改现有 `PlanningEngine` / `query.py` 代码
+- 残差缓存 `#4_df_all_1min_with_resid.parquet` 首次生成约 10s（全量 674k 行 predict），后续直接读取
+- 候选序列数约 12000~13000 个，DTW 对齐约需数秒（Python 循环，可后续优化为向量化）
+- 当前版本暂不支持连续性处理（可在上层调用时叠加）
+- `#4_df_all_1min_with_resid.parquet` 文件约 229MB，确保磁盘空间充足
+
+---
+
+### N. weight_comparison_eval_dtw.py — DTW 评估脚本
+
+**职责**：与 `weight_comparison_eval.py` 功能对等，但使用 `DTWQueryEngine` 替代 `PlanningEngine`，评估 DTW 时序查询在真实数据上的表现。
+
+**评估指标**：
+- DTW 加权余弦相似度 S
+- DTW 路径代价
+- 候选池规模
+- 时间偏移（候选末帧与查询时刻的时间差）
+- 规划中心 Loss（各维 + 总 Loss）
+
+**用法**：
+```bash
+python -m plan_center.weight_comparison_eval_dtw.py
+python -m plan_center.weight_comparison_eval_dtw.py --start 2025-06-01 --end 2025-06-02
+python -m plan_center.weight_comparison_eval_dtw.py --months 2026-01
+python -m plan_center.weight_comparison_eval_dtw.py --output dtw_eval_report.csv
+```
+
+**命令行参数**：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--start` | str | None | 起始日期 |
+| `--end` | str | None | 终止日期 |
+| `--months` | str[] | None | 月份列表 |
+| `--output` | str | `dtw_eval_report.csv` | CSV 输出路径 |
+| `--config` | str | None | 配置文件路径 |
+
+**输出 CSV 字段**：
+
+```csv
+query_ts, similarity_best, dtw_path_cost, n_candidates, dtw_path_length, time_offset_days,
+plan_center_主汽流量, plan_center_主汽压力, ...,
+actual_主汽流量, actual_主汽压力, ...,
+loss_total, loss_主汽压力, loss_炉膛差压, ...
+```
+
+**引用关系**：
+- 调用 `DTWQueryEngine.query_one()`
+- 调用 `plan_center.schemas.build_output_dataframe()`
+
+---
+
+### O. validate_visual_dtw.py — DTW 可视化验证
+
+**职责**：与 `validate_visual.py` 功能对等，逐点调用 DTW 查询引擎，生成实际值 vs 规划值对比图。
+
+**数据流**：
+
+```
+query_parquet
+    ↓ 随机/指定时间范围选取
+df_selected（N 分钟，由 --sample-step 控制）
+    ↓ 逐点 iterrows()（按 sample_step 采样）
+    ↓ engine.query_one()
+List[PlanResult]（含 DTW 特有诊断字段）
+    ↓ build_output_dataframe()
+df_out
+    ↓ build_plotly_figure_dtw()
+Plotly Figure（10 个子图）
+    ↓ HTML 模板
+validate_dtw_*.html
+```
+
+**输出 HTML 包含**（共 10 个子图）：
+
+| 行号 | 子图 | 内容 |
+|------|------|------|
+| 1-7 | 特征对比 | 实际值 vs 规划中心（plan_center_cols） |
+| 8 | DTW 相似度 S | 每点最佳相似度 [0,1] |
+| 9 | 时间偏移 | 候选末帧 vs 查询时刻的时间差（天） |
+| 10 | 候选池规模 | 每点候选序列数量 |
+
+**用法**：
+```bash
+python -m plan_center.validate_visual_dtw
+python -m plan_center.validate_visual_dtw --days 3
+python -m plan_center.validate_visual_dtw --start 2025-03-01 --end 2025-03-02
+python -m plan_center.validate_visual_dtw --sample-step 5 --output result.html
+```
+
+**命令行参数**：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--start` | str | None | 起始时间 |
+| `--end` | str | None | 终止时间 |
+| `--days` | int | 1 | 随机连续天数 |
+| `--seed` | int | None | 随机种子 |
+| `--sample-step` | int | 1 | 采样步长（分钟） |
+| `--output` | str | None | 输出 HTML 路径 |
+| `--config` | str | None | 配置文件路径 |
+
+**引用关系**：
+- 调用 `DTWQueryEngine.query_one()`
+- 调用 `schemas.build_output_dataframe()`
+- 复用 `NumpyEncoder` + `make_html_template_dtw()`（来自 validate_visual.py 模板）
+
+---
 
 **职责**：定义 PlanResult dataclass 和结果装配工具。
 

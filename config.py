@@ -156,12 +156,26 @@ class OptimizeV2Config:
 
 
 @dataclass(frozen=True)
+class DTWQueryConfig:
+    """DTW 时序查询配置。"""
+    ref_days: int              # 参考窗口天数
+    query_seq_len: int         # 查询序列长度（分钟）
+    dtw_min_len: int           # DTW 候选最短长度（分钟）
+    dtw_max_len: int           # DTW 候选最长长度（分钟）
+    slide_step: int            # 滑动步长（分钟）
+    top_k: int                 # Top-k
+    resid_cache_parquet: str   # 残差缓存 parquet 路径
+    dtw_feature_weights: dict[str, float]  # DTW 距离权重（欧氏距离中各特征权重）
+
+
+@dataclass(frozen=True)
 class PlanningConfig:
     features: FeatureConfig
     matching: MatchingConfig
     flow_gate: FlowGateConfig
     continuity: ContinuityConfig
     paths: PathsConfig
+    dtw_query: DTWQueryConfig | None = None
     filter: FilterConfig | None = None
     train: TrainConfig | None = None
     optimize: OptimizeConfig | None = None
@@ -354,6 +368,21 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
             report_json=str(opt_v2_raw.get("report_json", "optimize_v2_report.json")),
         )
 
+    # 解析 dtw_query 配置（可选）
+    dtw_raw = cfg.get("dtw_query", {})
+    dtw_cfg = None
+    if dtw_raw:
+        dtw_cfg = DTWQueryConfig(
+            ref_days=int(dtw_raw.get("ref_days", 3)),
+            query_seq_len=int(dtw_raw.get("query_seq_len", 5)),
+            dtw_min_len=int(dtw_raw.get("dtw_min_len", 4)),
+            dtw_max_len=int(dtw_raw.get("dtw_max_len", 6)),
+            slide_step=int(dtw_raw.get("slide_step", 1)),
+            top_k=int(dtw_raw.get("top_k", 5)),
+            resid_cache_parquet=str(dtw_raw.get("resid_cache_parquet", "")),
+            dtw_feature_weights={k: float(v) for k, v in dtw_raw.get("dtw_feature_weights", {}).items()},
+        )
+
     return PlanningConfig(
         features=features,
         matching=matching,
@@ -361,6 +390,7 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         continuity=continuity,
         filter=filter_cfg,
         paths=paths,
+        dtw_query=dtw_cfg,
         train=train_cfg,
         optimize=opt_cfg,
         optimize_genetic=opt_gen_cfg,
