@@ -59,6 +59,9 @@ def query_one(
         result.match_status = f"加权失败: {e}"
         return result
 
+    # NaN 保护：将 NaN/Inf 替换为 0
+    q_xw = np.nan_to_num(q_xw, nan=0.0, posinf=0.0, neginf=0.0)
+
     # 3. 余弦相似度
     q_xw_2d = q_xw.reshape(1, -1)
     s_all = cosine01(q_xw_2d, store.xw_standard)[0]

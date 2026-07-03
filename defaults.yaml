@@ -34,14 +34,14 @@ features:
   # 原始特征权重（主汽流量=0硬门控，热值=0占位）
   weights:
     主汽流量: 0.00
-    吨煤产气量: 0.40
-    主汽压力: 0.50
-    炉膛差压: 0.40
-    一次风流量: 0.25
-    床温: 0.30
-    料层差压: 0.20
-    锅炉出口氧量: 0.20
-    二次风风量: 0.35
+    吨煤产气量: 0.00
+    主汽压力: 0.98
+    炉膛差压: 0.50
+    一次风流量: 0.1
+    床温: 0.41
+    料层差压: 0.57
+    锅炉出口氧量: 0.42
+    二次风风量: 0.30
     热值: 0.00
 
   # 残差特征权重 = 对应原始权重 × ratio（默认0.5）
@@ -66,15 +66,16 @@ features:
   load_col: 主汽流量
   eff_col: 锅炉效率
   heat_value_col: 热值
+  date_col: 日期        # 稳定工况数据中的日期列名，用于最后一个月排除
 
 matching:
   # D = a*S + b*E（无频次分F）
   # S = 加权余弦相似度（所有特征均做 robust 归一化）
   # E = 效率分位数（0~1）
-  d_weight_s: 0.8    # a（相似度权重）
-  d_weight_e: 0.2    # b（效率权重）
+  d_weight_s: 1.0    # a（相似度权重）
+  d_weight_e: 0.0    # b（效率权重）
   top_k: 5
-  plan_center_mode: 2          # 1=最佳单样本, 2=Top-k加权均值
+  plan_center_mode: 1          # 1=最佳单样本, 2=Top-k加权均值
   topk_avg_method: weighted    # "mean" | "weighted"
   low_sim_fallback_threshold: 0.75
   enable_low_sim_fallback: true
@@ -153,16 +154,20 @@ train:
 time_col: null    # null=自动识别时间列
 
 # =============================================
-# 权重寻优配置
+# 权重寻优配置（数值梯度下降）
 # =============================================
 optimize:
   # 数值梯度下降超参数
   learning_rate: 0.05        # 梯度下降学习率
   num_epochs: 20             # 训练轮次
-  batch_days: 5              # 每个 batch 的天数
-  fd_step: 1e-3              # 中心差分步长（相对权重和的比例，乘以当前权重和后作为扰动量）
+  batch_days: 1              # 每个 batch 的天数
+  fd_step: 1e-3              # 差分步长（相对权重和的比例，乘以当前权重和后作为扰动量）
   random_seed: 42            # 随机种子（控制天切分的shuffle顺序）
-  max_weight: 5.0            # 权重上界（防止无限增大）
+  max_weight: 1.0            # 权重上界（防止无限增大）
+
+  # 加速选项
+  grad_mode: forward         # "forward"=前向差分(快,9次前向/batch) | "central"=中心差分(准,17次前向/batch)
+  query_stride: 1            # 查询数据降采样：每 N 行取 1 行（1=不降采样，5=约5倍提速）
 
   # loss 中各控制变量的权重（0=不参与loss）
   # 主汽流量/热值固定为0（硬门控变量）
@@ -181,3 +186,85 @@ optimize:
   # 输出报告路径（相对于 output_dir）
   report_csv: "optimize_report.csv"
   report_json: "optimize_report.json"
+
+# =============================================
+# 遗传进化算法权重寻优配置
+# =============================================
+optimize_genetic:
+  # 种群参数
+  population_size: 50       # 种群大小
+  n_generations: 40         # 迭代代数
+  elite_size: 5             # 精英保留数（不参与交叉变异，直接进入下一代）
+
+  # 选择参数
+  tournament_size: 3        # 锦标赛选择参赛者数
+
+  # 交叉参数
+  crossover_rate: 0.8       # 交叉概率
+  crossover_method: blend  # "blend"=模拟二进制交叉(SBX) | "uniform"=均匀交叉
+
+  # 变异参数
+  mutation_rate: 0.15       # 变异概率（按个体）
+  mutation_scale: 0.1       # 变异幅度（相对标准差的比例）
+
+  # 约束（开放限制：只要非负即可）
+  min_weight: 0.0           # 权重下界（非负）
+  max_weight: 10.0           # 权重上界（允许较大权重）
+
+  # 加速选项
+  query_stride: 5           # 查询数据降采样：每 N 行取 1 行
+  batch_days: 5             # 评估batch天数
+  sbx_eta: 15.0             # SBX分布指数（控制子代与父代的接近程度）
+
+  # loss 配置（继承 defaults.yaml 的 loss_feature_weights）
+  # 遗传算法寻优期间强制关闭低相似度回退
+  disable_fallback_during_opt: true
+
+  # 输出报告路径（相对于 output_dir）
+  report_csv: "optimize_genetic_report.csv"
+  report_json: "optimize_genetic_report.json"
+
+# =============================================
+# 遗传进化算法权重寻优 V2（单 evaluator，最后一个月数据）
+# =============================================
+optimize_v2:
+  # 种群参数
+  population_size: 75       # 种群大小
+  n_generations: 100         # 迭代代数
+  elite_size: 7             # 精英保留数
+
+  # 选择参数
+  tournament_size: 5        # 锦标赛选择参赛者数
+
+  # 交叉参数
+  crossover_rate: 0.8       # 交叉概率
+  crossover_method: blend  # "blend"=SBX | "uniform"=均匀交叉
+
+  # 变异参数
+  mutation_rate: 0.15       # 变异概率
+  mutation_scale: 0.1       # 变异幅度
+
+  # 约束（开放限制：只要非负即可）
+  min_weight: 0.0           # 权重下界（非负）
+  max_weight: 10.0          # 权重上界（允许较大权重）
+
+  # 数据策略
+  query_stride: 5          # 降采样步长（60=每60行取1行，约720行/月）
+
+  # SBX参数
+  sbx_eta: 15.0             # SBX分布指数
+
+  # loss 配置（继承 defaults.yaml 的 loss_feature_weights）
+  disable_fallback_during_opt: true
+  loss_feature_weights:
+    主汽压力: 1.0
+    炉膛差压: 1.0
+    一次风流量: 1.0
+    床温: 1.0
+    料层差压: 1.0
+    锅炉出口氧量: 0.6
+    二次风风量: 0.6
+
+  # 输出报告路径
+  report_csv: "optimize_v2_report.csv"
+  report_json: "optimize_v2_report.json"

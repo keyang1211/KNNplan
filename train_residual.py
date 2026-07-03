@@ -32,8 +32,13 @@ from .config import PlanningConfig, load_config
 # 数据加载
 # =========================
 
-def load_stable_data(parquet_path: str, column_aliases: dict[str, str] | None = None) -> pd.DataFrame:
-    """读取稳定工况数据。"""
+def load_stable_data(
+    parquet_path: str,
+    column_aliases: dict[str, str] | None = None,
+    last_month_exclusion_parquet: str | None = None,
+    date_col: str = "日期",
+) -> pd.DataFrame:
+    """读取稳定工况数据，可选排除与另一数据集最后一个月重叠的样本。"""
     df = pd.read_parquet(parquet_path)
 
     # 应用列别名映射
@@ -41,15 +46,63 @@ def load_stable_data(parquet_path: str, column_aliases: dict[str, str] | None = 
         for old, new in column_aliases.items():
             if old in df.columns:
                 if new in df.columns:
-                    # 目标列已存在，直接删除源列（避免重复列）
                     df = df.drop(columns=[old])
                     print(f"目标列 '{new}' 已存在，已删除源列 '{old}'")
                 else:
                     df = df.rename(columns={old: new})
                     print(f"已应用列别名映射: {old} → {new}")
 
+    # 排除最后一个月（防止数据泄露）
+    if last_month_exclusion_parquet:
+        _exclude_last_month(df, last_month_exclusion_parquet, date_col)
+
     print(f"读取稳定工况数据: {df.shape}")
     return df
+
+
+def _exclude_last_month(
+    df: pd.DataFrame,
+    reference_parquet: str,
+    date_col: str = "日期",
+) -> None:
+    """
+    根据参考数据集（如 #4_df_all_1min.parquet）的时间范围，
+    剔除稳定工况数据中处于参考数据最后一个月内的样本。
+
+    通过确定参考数据的最大时间并向前推一个月作为截止时间，
+    然后筛选掉稳定工况数据中日期在此截止时间之后的样本。
+
+    参数：
+        df: 稳定工况 DataFrame（原地修改）
+        reference_parquet: 参考数据 parquet 路径
+        date_col: 稳定工况数据中的日期列名
+    """
+    if date_col not in df.columns:
+        print(f"警告: 稳定工况数据中未找到日期列 '{date_col}'，跳过最后一个月排除")
+        return
+
+    # 读取参考数据的时间范围
+    ref_df = pd.read_parquet(reference_parquet)
+    time_col = "时间" if "时间" in ref_df.columns else None
+    if time_col is None:
+        print(f"警告: 参考数据中未找到 '时间' 列，跳过最后一个月排除")
+        return
+
+    ref_df[time_col] = pd.to_datetime(ref_df[time_col])
+    max_time = ref_df[time_col].max()
+    cutoff = max_time - pd.DateOffset(months=1)
+
+    # 确保日期列为 datetime 类型
+    df[date_col] = pd.to_datetime(df[date_col])
+
+    before = len(df)
+    mask = df[date_col] < cutoff
+    df.drop(index=df.index[~mask], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    after = len(df)
+
+    print(f"最后一个月排除: 参考数据截止时间 {max_time}，剔除 >= {cutoff} 的样本")
+    print(f"  {before} → {after}，排除 {before - after} 行（{ (before - after) / max(before, 1) * 100:.2f}%）")
 
 
 # =========================
@@ -507,7 +560,12 @@ def main():
 
     # 1. 读取稳定工况数据
     print("[1] 读取稳定工况数据...")
-    df = load_stable_data(train_cfg.input_parquet, cfg.features.column_aliases)
+    df = load_stable_data(
+        train_cfg.input_parquet,
+        cfg.features.column_aliases,
+        last_month_exclusion_parquet=cfg.paths.query_parquet,
+        date_col=cfg.features.date_col if hasattr(cfg.features, "date_col") else "日期",
+    )
 
     # 2. 合理工况筛选
     if train_cfg.enable_filter:

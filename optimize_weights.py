@@ -13,7 +13,7 @@ Loss 计算：
 高性能设计：
     - FastEvaluator 一次性预计算标准样本归一化矩阵和查询批次归一化矩阵
     - 每次前向只做矩阵运算（换权重 → √w 缩放 → 余弦 → TopK → 均值 → loss）
-    - 数值梯度：8 参数中心差分（16 次前向/batch）
+    - 数值梯度：8 参数前向差分（9 次前向/batch）
 
 用法:
     python -m plan_center.optimize_weights
@@ -36,50 +36,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # FastEvaluator：预计算所有不随权重变化的量
 # =============================================================
 
-class FastEvaluator:
-    """
-    向量化前向计算器。
+class StandardCache:
+    """标准样本侧的预计算量（不随权重、不随 batch 变化，全程只算一次）。"""
 
-    预计算：
-        - 标准样本未加权归一化矩阵 V_norm (N, D)
-        - 标准样本效率分 E (N,)
-        - 标准样本负荷 loads (N,)
-        - 查询批次未加权归一化矩阵 Q_norm (M, D)
-        - 查询批次实际控制变量值 actual_vals (M, K)（K=loss变量数）
-        - 硬门控掩码 gate_mask (M, N)
-        - IQR 归一化尺度 iqr_scales (K,)
-        - 其他配置
-    """
-
-    def __init__(self, cfg, store, query_batch_df, time_col):
-        from plan_center.config import build_feature_weights
-        from plan_center.similarity import normalize_features, weight_array
+    def __init__(self, cfg, store):
+        from plan_center.similarity import normalize_features
 
         feat = cfg.features
-        opt = cfg.optimize
-        match_cfg = cfg.matching
-        gate_cfg = cfg.flow_gate
-
-        self.feat = feat
-        self.match_cfg = match_cfg
-        self.gate_cfg = gate_cfg
-        self.opt = opt
-
-        # 15 维特征名：[raw_features..., resid_*...]
         residual_cols = [f"resid_{t}" for t in feat.residual_targets]
         self.sim_feature_cols = list(feat.raw_features) + residual_cols
         self.D = len(self.sim_feature_cols)
 
-        # 8 个可调权重的特征名（raw_features，主汽流量和热值固定0）
-        self.raw_feature_names = list(feat.raw_features)
-        # 被优化的特征（权重非0的原始特征）
-        self.opt_feature_names = [
-            c for c in self.raw_feature_names
-            if c not in (feat.load_col, feat.heat_value_col)
-        ]
-        self.n_opt = len(self.opt_feature_names)
-
-        # ---- 标准样本预计算 ----
+        # 标准样本未加权归一化矩阵（只算一次）
         V_norm_df = normalize_features(
             store.df_standard, self.sim_feature_cols, store.norm_stats, normalize_all=True
         )
@@ -87,21 +55,78 @@ class FastEvaluator:
         self.eff_score = store.eff_score_all.astype(np.float64)   # (N,)
         self.loads_std = store.loads_standard.astype(np.float64)  # (N,)
         self.df_standard = store.df_standard
+
+
+class FastEvaluator:
+    """
+    向量化前向计算器。
+
+    标准样本侧的量从 StandardCache 复用（不重复归一化）；
+    每个 batch 只预计算查询侧的量。
+    """
+
+    def __init__(self, cfg, std_cache, store, query_batch_df, time_col):
+        from plan_center.similarity import normalize_features
+
+        feat = cfg.features
+        opt = cfg.optimize
+        opt_gen = cfg.optimize_genetic
+        match_cfg = cfg.matching
+        gate_cfg = cfg.flow_gate
+
+        self.feat = feat
+        self.match_cfg = match_cfg
+        self.gate_cfg = gate_cfg
+
+        # loss_feature_weights: 优先 optimize → optimize_genetic → optimize_v2 → 默认
+        if opt is not None and hasattr(opt, 'loss_feature_weights'):
+            self.opt = opt
+            self.loss_feature_weights = opt.loss_feature_weights
+        elif opt_gen is not None and hasattr(opt_gen, 'loss_feature_weights'):
+            self.opt = opt_gen
+            self.loss_feature_weights = opt_gen.loss_feature_weights
+        elif getattr(cfg, 'optimize_v2', None) is not None:
+            self.opt = cfg.optimize_v2
+            self.loss_feature_weights = cfg.optimize_v2.loss_feature_weights
+        else:
+            self.opt = None
+            self.loss_feature_weights = {
+                "主汽压力": 1.0, "炉膛差压": 1.0, "一次风流量": 1.0,
+                "床温": 1.0, "料层差压": 1.0, "锅炉出口氧量": 0.6, "二次风风量": 0.6,
+            }
+
+        # 复用标准样本侧预计算
+        self.sim_feature_cols = std_cache.sim_feature_cols
+        self.D = std_cache.D
+        self.V_norm = std_cache.V_norm
+        self.eff_score = std_cache.eff_score
+        self.loads_std = std_cache.loads_std
+        self.df_standard = std_cache.df_standard
         self.plan_center_cols = list(feat.plan_center_cols)
 
+        # 8 个可调权重的特征名（raw_features，主汽流量和热值固定0）
+        self.raw_feature_names = list(feat.raw_features)
+        self.opt_feature_names = [
+            c for c in self.raw_feature_names
+            if c not in (feat.load_col, feat.heat_value_col)
+        ]
+        self.n_opt = len(self.opt_feature_names)
+
         # ---- 查询批次预计算 ----
+        sim_feature_cols = list(feat.raw_features) + [f"resid_{t}" for t in feat.residual_targets]
         Q_norm_df = normalize_features(
-            query_batch_df, self.sim_feature_cols, store.norm_stats, normalize_all=True
+            query_batch_df, sim_feature_cols, store.norm_stats, normalize_all=True
         )
-        self.Q_norm = Q_norm_df[self.sim_feature_cols].values.astype(np.float64)   # (M, D)
+        self.sim_feature_cols = sim_feature_cols
+        self.Q_norm = Q_norm_df[sim_feature_cols].values.astype(np.float64)   # (M, D)
         self.M = len(self.Q_norm)
 
         # 查询批次实际控制变量值（用于计算 loss）
-        loss_cols = [c for c in opt.loss_feature_weights if opt.loss_feature_weights[c] > 0]
+        loss_cols = [c for c in self.loss_feature_weights if self.loss_feature_weights[c] > 0]
         self.loss_cols = loss_cols
         self.actual_vals = query_batch_df[loss_cols].values.astype(np.float64)   # (M, K)
         self.loss_w = np.array(
-            [opt.loss_feature_weights[c] for c in loss_cols], dtype=np.float64
+            [self.loss_feature_weights[c] for c in loss_cols], dtype=np.float64
         )  # (K,)
 
         # IQR 尺度（用于归一化误差）
@@ -311,22 +336,35 @@ def precheck_evaluator(evaluator, cfg, store, models, sample_n=50, tol=0.05):
 # 梯度下降主循环
 # =============================================================
 
-def numerical_gradient(evaluator, opt_weights, fd_step_abs):
+def numerical_gradient(evaluator, opt_weights, fd_step_abs, base_loss=None, mode="forward"):
     """
-    8 参数中心差分数值梯度。
+    数值梯度。
+
+    mode="forward"：前向差分，(f(x+h)-f(x))/h，每参数 1 次前向（共 n_opt 次 + 复用 base_loss）
+    mode="central"：中心差分，(f(x+h)-f(x-h))/2h，每参数 2 次前向（更准但慢一倍）
 
     fd_step_abs: 实际扰动量（已乘以权重和）
+    base_loss:   当前权重的 loss（forward 模式复用，省一次前向）
     返回：(n_opt,) 梯度向量
     """
     grad = np.zeros_like(opt_weights)
-    for i in range(len(opt_weights)):
-        w_plus = opt_weights.copy()
-        w_plus[i] += fd_step_abs
-        w_minus = opt_weights.copy()
-        w_minus[i] -= fd_step_abs
-        f_plus = evaluator.forward(w_plus)
-        f_minus = evaluator.forward(w_minus)
-        grad[i] = (f_plus - f_minus) / (2 * fd_step_abs)
+    if mode == "central":
+        for i in range(len(opt_weights)):
+            w_plus = opt_weights.copy()
+            w_plus[i] += fd_step_abs
+            w_minus = opt_weights.copy()
+            w_minus[i] -= fd_step_abs
+            f_plus = evaluator.forward(w_plus)
+            f_minus = evaluator.forward(w_minus)
+            grad[i] = (f_plus - f_minus) / (2 * fd_step_abs)
+    else:  # forward
+        if base_loss is None:
+            base_loss = evaluator.forward(opt_weights)
+        for i in range(len(opt_weights)):
+            w_plus = opt_weights.copy()
+            w_plus[i] += fd_step_abs
+            f_plus = evaluator.forward(w_plus)
+            grad[i] = (f_plus - base_loss) / fd_step_abs
     return grad
 
 
@@ -379,6 +417,24 @@ def run_optimize(config_path=None):
     df_query = add_residual_features_batch(df_query, models, cfg.features)
     print(f"    残差特征计算完成，耗时 {time.perf_counter() - t0:.1f}s")
 
+    # 关键：丢弃相似度特征 / loss 列 / 负荷列中含 NaN 的行
+    # （否则 NaN 会污染 loss → 梯度 → 权重，导致全程 nan）
+    residual_cols = [f"resid_{t}" for t in cfg.features.residual_targets]
+    loss_cols_chk = [c for c in opt.loss_feature_weights if opt.loss_feature_weights[c] > 0]
+    nan_check_cols = list(dict.fromkeys(
+        list(cfg.features.raw_features) + residual_cols + loss_cols_chk + [cfg.features.load_col]
+    ))
+    n_before = len(df_query)
+    df_query = df_query.dropna(subset=nan_check_cols).reset_index(drop=True)
+    n_dropped = n_before - len(df_query)
+    if n_dropped:
+        print(f"    丢弃含 NaN 行: {n_dropped} 行（{n_dropped / n_before * 100:.2f}%），剩余 {len(df_query)} 行")
+
+    # 查询数据降采样（加速：每 query_stride 行取 1 行）
+    if opt.query_stride > 1:
+        df_query = df_query.iloc[::opt.query_stride].reset_index(drop=True)
+        print(f"    降采样 stride={opt.query_stride}，剩余 {len(df_query)} 行")
+
     # 按天切分
     day_dfs = split_by_day(df_query, time_col)
     day_keys = sorted(day_dfs.keys())
@@ -411,9 +467,13 @@ def run_optimize(config_path=None):
     best_loss = np.inf
     best_weights = current_weights.copy()
 
-    print(f"\n[4] 开始梯度下降（{opt.num_epochs} epoch，每 epoch {opt.batch_days} 天/batch）...")
+    print(f"\n[4] 开始梯度下降（{opt.num_epochs} epoch，每 epoch {opt.batch_days} 天/batch，梯度={opt.grad_mode}）...")
+
+    # 标准样本侧预计算（全程只算一次，避免每 batch 重复归一化 9k+ 样本）
+    std_cache = StandardCache(cfg, store)
 
     global_batch_count = 0  # 全局 batch 计数器
+    nan_batch_count = 0     # 跳过的 NaN batch 计数
 
     for epoch in range(opt.num_epochs):
         # shuffle 天顺序
@@ -430,16 +490,32 @@ def run_optimize(config_path=None):
             if len(batch_df) == 0:
                 continue
 
-            # 构建 FastEvaluator
-            evaluator = FastEvaluator(cfg, store, batch_df, time_col)
+            # 构建 FastEvaluator（复用标准样本预计算）
+            evaluator = FastEvaluator(cfg, std_cache, store, batch_df, time_col)
 
             # 前向计算 loss
             loss = evaluator.forward(current_weights)
+
+            # NaN 防护：跳过该 batch，不更新权重（避免污染）
+            if not np.isfinite(loss):
+                nan_batch_count += 1
+                global_batch_count += 1
+                continue
+
             epoch_losses.append(loss)
 
-            # 计算数值梯度
+            # 计算数值梯度（forward 模式复用上面的 loss）
             fd_step_abs = opt.fd_step * (current_weights.sum() + 1e-8)
-            grad = numerical_gradient(evaluator, current_weights, fd_step_abs)
+            grad = numerical_gradient(
+                evaluator, current_weights, fd_step_abs,
+                base_loss=loss, mode=opt.grad_mode
+            )
+
+            # 梯度 NaN 防护
+            if not np.all(np.isfinite(grad)):
+                nan_batch_count += 1
+                global_batch_count += 1
+                continue
 
             # 梯度下降更新
             current_weights = current_weights - lr * grad
@@ -471,6 +547,8 @@ def run_optimize(config_path=None):
               + "  ".join(f"{n}={w:.4f}" for n, w in zip(opt_feature_names, current_weights)))
 
     # 6. 输出报告
+    if nan_batch_count:
+        print(f"\n    [提示] 共跳过 {nan_batch_count} 个含 NaN 的 batch（已防护，未污染权重）")
     print(f"\n[5] 最优 loss={best_loss:.6f}，最优权重:")
     for name, w in zip(opt_feature_names, best_weights):
         print(f"    {name}: {w:.6f}")

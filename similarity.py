@@ -133,9 +133,10 @@ def weighted_vector_1d(
         if c in norm_stats:
             x_norm[i] = (x_arr[i] - norm_stats[c]["median"]) / norm_stats[c]["iqr"]
         else:
-            # 无归一化参数时，使用 min-max 归一化到 [0,1]（临时方案）
-            # 实际应确保所有特征都在 norm_stats 中
             x_norm[i] = x_arr[i]
+
+    # NaN 保护：将 NaN/Inf 替换为 0（中位数归一化后的 0 代表中位数水平）
+    x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
 
     q_xw = (x_norm * np.sqrt(w)).astype(np.float32)
     return q_xw, w
@@ -148,6 +149,7 @@ def weighted_vector_1d(
 def cosine01(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     加权余弦相似度，映射到 [0, 1]。
+    输入含 NaN 时，自动替换为 0（中位数归一化后的 0 代表中位数水平，避免中断计算）。
 
     参数：
         a: (M, D) 加权向量矩阵
@@ -156,6 +158,16 @@ def cosine01(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     返回：
         (M, N) 相似度矩阵，值域 [0, 1]
     """
+    # NaN 保护：将 NaN 替换为 0.0（中位数归一化后的 0 = 中位数水平）
+    if np.isscalar(a) or np.isscalar(b):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+    else:
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+        b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+
     sim = cosine_similarity(a, b)
     sim = np.clip(sim, -1.0, 1.0)
     return ((sim + 1.0) / 2.0).astype(np.float32)

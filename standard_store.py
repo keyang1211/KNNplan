@@ -196,9 +196,11 @@ def build_standard_store(cfg: PlanningConfig) -> StandardStore:
         norm_stats = robust_norm_stats(df, sim_feature_cols)
         print("未找到归一化参数文件，使用数据计算")
 
-    # 5. 加权特征矩阵
+    # 5. 加权特征矩阵（含 NaN 保护）
     weights = build_feature_weights(feat)
     xw_standard, _ = weighted_matrix(df, sim_feature_cols, norm_stats, weights)
+    # NaN 保护：将加权矩阵中的 NaN/Inf 替换为 0，避免后续 cosine_similarity 报错
+    xw_standard = np.nan_to_num(xw_standard, nan=0.0, posinf=0.0, neginf=0.0)
 
     # 6. 效率分位数 E
     eff_score_all = pct_rank(df[feat.eff_col].values.astype(float))

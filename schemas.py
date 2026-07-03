@@ -92,6 +92,10 @@ def plan_result_to_row(result: PlanResult, plan_center_cols: list[str]) -> dict:
     row["低相似度回退阈值"] = result.fallback_threshold
     row["规划中心来源"] = result.plan_center_source
 
+    # 时间差诊断（动态附加属性，可选）
+    row["Top1时间差_天"] = getattr(result, '_top1_time_diff', np.nan)
+    row["Top5平均时间差_天"] = getattr(result, '_top5_mean_time_diff', np.nan)
+
     return row
 
 

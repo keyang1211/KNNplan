@@ -26,6 +26,7 @@ class FeatureConfig:
     load_col: str
     eff_col: str
     heat_value_col: str
+    date_col: str = "日期"      # 稳定工况数据中的日期列名
     column_aliases: dict[str, str] = field(default_factory=dict)
 
 
@@ -108,6 +109,50 @@ class OptimizeConfig:
     disable_fallback_during_opt: bool
     report_csv: str
     report_json: str
+    grad_mode: str = "forward"      # "forward"=前向差分(快), "central"=中心差分(准)
+    query_stride: int = 1           # 查询数据降采样步长（每 N 行取 1 行，1=不降采样）
+
+
+@dataclass(frozen=True)
+class OptimizeGeneticConfig:
+    """遗传进化算法权重寻优配置。"""
+    population_size: int
+    n_generations: int
+    elite_size: int
+    tournament_size: int
+    crossover_rate: float
+    crossover_method: str       # "blend" | "uniform"
+    mutation_rate: float
+    mutation_scale: float
+    min_weight: float
+    max_weight: float
+    query_stride: int
+    batch_days: int
+    sbx_eta: float
+    disable_fallback_during_opt: bool
+    report_csv: str
+    report_json: str
+
+
+@dataclass(frozen=True)
+class OptimizeV2Config:
+    """遗传进化算法 V2 配置（单 evaluator 版）。"""
+    population_size: int
+    n_generations: int
+    elite_size: int
+    tournament_size: int
+    crossover_rate: float
+    crossover_method: str
+    mutation_rate: float
+    mutation_scale: float
+    min_weight: float
+    max_weight: float
+    query_stride: int
+    sbx_eta: float
+    disable_fallback_during_opt: bool
+    loss_feature_weights: dict[str, float]
+    report_csv: str
+    report_json: str
 
 
 @dataclass(frozen=True)
@@ -120,6 +165,8 @@ class PlanningConfig:
     filter: FilterConfig | None = None
     train: TrainConfig | None = None
     optimize: OptimizeConfig | None = None
+    optimize_genetic: OptimizeGeneticConfig | None = None
+    optimize_v2: OptimizeV2Config | None = None
     time_col: str | None = None
 
 
@@ -178,6 +225,7 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         load_col=feat_raw.get("load_col", "主汽流量"),
         eff_col=feat_raw.get("eff_col", "锅炉效率"),
         heat_value_col=feat_raw.get("heat_value_col", "热值"),
+        date_col=str(feat_raw.get("date_col", "日期")),
         column_aliases=feat_raw.get("column_aliases", {}),
     )
 
@@ -256,6 +304,54 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
             disable_fallback_during_opt=bool(opt_raw.get("disable_fallback_during_opt", True)),
             report_csv=str(opt_raw.get("report_csv", "optimize_report.csv")),
             report_json=str(opt_raw.get("report_json", "optimize_report.json")),
+            grad_mode=str(opt_raw.get("grad_mode", "forward")),
+            query_stride=int(opt_raw.get("query_stride", 1)),
+        )
+
+    # 解析 optimize_genetic 配置（可选）
+    opt_gen_raw = cfg.get("optimize_genetic", {})
+    opt_gen_cfg = None
+    if opt_gen_raw:
+        opt_gen_cfg = OptimizeGeneticConfig(
+            population_size=int(opt_gen_raw.get("population_size", 50)),
+            n_generations=int(opt_gen_raw.get("n_generations", 40)),
+            elite_size=int(opt_gen_raw.get("elite_size", 5)),
+            tournament_size=int(opt_gen_raw.get("tournament_size", 3)),
+            crossover_rate=float(opt_gen_raw.get("crossover_rate", 0.8)),
+            crossover_method=str(opt_gen_raw.get("crossover_method", "blend")),
+            mutation_rate=float(opt_gen_raw.get("mutation_rate", 0.15)),
+            mutation_scale=float(opt_gen_raw.get("mutation_scale", 0.1)),
+            min_weight=float(opt_gen_raw.get("min_weight", 0.0)),
+            max_weight=float(opt_gen_raw.get("max_weight", 5.0)),
+            query_stride=int(opt_gen_raw.get("query_stride", 5)),
+            batch_days=int(opt_gen_raw.get("batch_days", 5)),
+            sbx_eta=float(opt_gen_raw.get("sbx_eta", 15.0)),
+            disable_fallback_during_opt=bool(opt_gen_raw.get("disable_fallback_during_opt", True)),
+            report_csv=str(opt_gen_raw.get("report_csv", "optimize_genetic_report.csv")),
+            report_json=str(opt_gen_raw.get("report_json", "optimize_genetic_report.json")),
+        )
+
+    # 解析 optimize_v2 配置（可选）
+    opt_v2_raw = cfg.get("optimize_v2", {})
+    opt_v2_cfg = None
+    if opt_v2_raw:
+        opt_v2_cfg = OptimizeV2Config(
+            population_size=int(opt_v2_raw.get("population_size", 50)),
+            n_generations=int(opt_v2_raw.get("n_generations", 40)),
+            elite_size=int(opt_v2_raw.get("elite_size", 5)),
+            tournament_size=int(opt_v2_raw.get("tournament_size", 3)),
+            crossover_rate=float(opt_v2_raw.get("crossover_rate", 0.8)),
+            crossover_method=str(opt_v2_raw.get("crossover_method", "blend")),
+            mutation_rate=float(opt_v2_raw.get("mutation_rate", 0.15)),
+            mutation_scale=float(opt_v2_raw.get("mutation_scale", 0.1)),
+            min_weight=float(opt_v2_raw.get("min_weight", 0.0)),
+            max_weight=float(opt_v2_raw.get("max_weight", 1.0)),
+            query_stride=int(opt_v2_raw.get("query_stride", 5)),
+            sbx_eta=float(opt_v2_raw.get("sbx_eta", 15.0)),
+            disable_fallback_during_opt=bool(opt_v2_raw.get("disable_fallback_during_opt", True)),
+            loss_feature_weights={k: float(v) for k, v in opt_v2_raw.get("loss_feature_weights", {}).items()},
+            report_csv=str(opt_v2_raw.get("report_csv", "optimize_v2_report.csv")),
+            report_json=str(opt_v2_raw.get("report_json", "optimize_v2_report.json")),
         )
 
     return PlanningConfig(
@@ -267,6 +363,8 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         paths=paths,
         train=train_cfg,
         optimize=opt_cfg,
+        optimize_genetic=opt_gen_cfg,
+        optimize_v2=opt_v2_cfg,
         time_col=time_col,
     )
 
