@@ -100,8 +100,8 @@ def dtw_align(
         elif j == 0:
             i -= 1
         else:
-            candidates = [D[i - 1, j - 1], D[i - 1, j], D[i, j - 1]]
-            argmin = int(np.argmin(candidates))
+            candidates_d = [D[i - 1, j - 1], D[i - 1, j], D[i, j - 1]]
+            argmin = int(np.argmin(candidates_d))
             if argmin == 0:
                 i -= 1
                 j -= 1
@@ -113,6 +113,34 @@ def dtw_align(
 
     aligned_pairs.reverse()
     return aligned_pairs, float(D[-1, -1])
+
+
+def dtw_align_with_coverage(
+    query_seq: np.ndarray,
+    cand_seq: np.ndarray,
+    feature_weights: np.ndarray | None = None,
+    min_coverage: int = 4,
+) -> tuple[list[tuple[int, int]], float, bool]:
+    """
+    DTW 对齐 + 候选覆盖帧检查。
+
+    比 dtw_align() 多返回一个 bool: 路径中涉及的不重复候选帧数 >= min_coverage。
+
+    参数：
+        query_seq: (T_q, D) 查询序列
+        cand_seq: (T_c, D) 候选序列
+        feature_weights: (D,) 各特征的平方根权重
+        min_coverage: 最少不重复候选帧数（默认 4）
+
+    返回：
+        (aligned_pairs, path_cost, coverage_ok)
+    """
+    aligned_pairs, path_cost = dtw_align(query_seq, cand_seq, feature_weights)
+    # 计算路径覆盖的不重复候选帧数
+    cand_indices = np.array([j for _, j in aligned_pairs])
+    n_unique = int(np.unique(cand_indices).size)
+    coverage_ok = n_unique >= min_coverage
+    return aligned_pairs, path_cost, coverage_ok
 
 
 # ============================================================
@@ -329,44 +357,53 @@ def query_dtw(
 
     query_matrix = query_df[sim_feature_cols].values.astype(float)  # (T_q, D)
 
-    # ---- 5. 构建候选矩阵 ----
-    # 候选序列滑动范围: [ref_window 开头, ref_window 末尾 - query_seq_len)
-    # 即排除了末尾 query_seq_len 个点（这些点属于查询序列）
+    # ---- 5. 构建候选矩阵（固定 dtw_max_len 分钟，滑动步长 1 分钟）----
+    # 候选序列滑动范围: [ref_window 开头, ref_window 末尾 - dtw_max_len)
+    # 固定用 dtw_max_len 长度切分，不再 4/5/6 三种
+    cand_length = dtw_cfg.dtw_max_len
     cand_pool_start = 0
     cand_pool_end = ref_n - dtw_cfg.query_seq_len  # 不包含 query_seq 部分
-    if cand_pool_end < cand_pool_start + dtw_cfg.dtw_min_len:
+    if cand_pool_end < cand_pool_start + cand_length:
         cand_pool_end = ref_n  # 回退：候选池不够时用全部 ref_window
 
     candidates: list[dict] = []
-    for length in range(dtw_cfg.dtw_min_len, dtw_cfg.dtw_max_len + 1):
-        for start in range(cand_pool_start, cand_pool_end - length + 1, dtw_cfg.slide_step):
-            end = start + length
-            mat = ref_window[sim_feature_cols].iloc[start:end].values.astype(float)
-            # 映射回全局索引
-            global_start = int((ref_df_resid[time_col] <= t_start).sum()) + start
-            candidates.append({
-                "orig_start_idx": global_start,
-                "orig_end_idx": global_start + length,
-                "length": length,
-                "matrix": mat,
-            })
+    for start in range(cand_pool_start, cand_pool_end - cand_length + 1, dtw_cfg.slide_step):
+        end = start + cand_length
+        mat = ref_window[sim_feature_cols].iloc[start:end].values.astype(float)
+        # 映射回全局索引
+        global_start = int((ref_df_resid[time_col] <= t_start).sum()) + start
+        candidates.append({
+            "orig_start_idx": global_start,
+            "orig_end_idx": global_start + cand_length,
+            "length": cand_length,
+            "matrix": mat,
+        })
 
     if verbose:
         total_cands = len(candidates)
         print(f"[DTW] 候选序列数: {total_cands} "
               f"（范围 {dtw_cfg.dtw_min_len}~{dtw_cfg.dtw_max_len} min，步长 {dtw_cfg.slide_step} min）")
 
-    # ---- 6. DTW 对齐 + 加权 cosine 均值 ----
+    # ---- 6. DTW 对齐 + 覆盖帧检查 + 加权 cosine 均值 ----
     if verbose:
-        print(f"[DTW] DTW 对齐 + 加权 cosine 计算中 ...")
+        print(f"[DTW] DTW 对齐 + 覆盖帧检查 + 加权 cosine 计算中 ...")
 
     sim_scores: list[float] = []
+    coverage_ok_list: list[bool] = []
     for cand in candidates:
-        aligned_pairs, path_cost = dtw_align(query_matrix, cand["matrix"])
-        sim = dtw_weighted_cosine_mean(query_matrix, cand["matrix"], aligned_pairs)
-        cand["dtw_cost"] = path_cost          # 保存 DTW 代价
-        cand["path_length"] = len(aligned_pairs)  # 保存路径长度
-        sim_scores.append(sim)
+        aligned_pairs, path_cost, coverage_ok = dtw_align_with_coverage(
+            query_matrix, cand["matrix"],
+            min_coverage=dtw_cfg.dtw_min_len   # 默认 4
+        )
+        # 覆盖帧不足的候选相似度置 0（不参与 Top-k）
+        if not coverage_ok:
+            sim_scores.append(0.0)
+        else:
+            sim = dtw_weighted_cosine_mean(query_matrix, cand["matrix"], aligned_pairs)
+            sim_scores.append(sim)
+        cand["dtw_cost"] = path_cost
+        cand["path_length"] = len(aligned_pairs)
+        coverage_ok_list.append(coverage_ok)
 
     sim_scores = np.array(sim_scores, dtype=float)
 
