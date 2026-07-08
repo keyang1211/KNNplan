@@ -7,15 +7,15 @@ plan_center/
 ├── __init__.py              # 包入口，导出主要类和函数
 ├── config.py                # 配置 dataclass + load_config(yaml)
 ├── defaults.yaml            # 默认配置文件（所有参数集中在此）
-├── similarity.py            # 相似度计算纯函数（归一化、加权余弦、硬门控）
+├── similarity.py            # 相似度计算纯函数（马氏距离 + 旧余弦函数供DTW使用 + 硬门控）
 ├── features.py              # 残差模型加载 + 残差特征计算（9原→15维）
-├── standard_store.py        # 标准样本V加载（读parquet，预计算加权特征矩阵）
+├── standard_store.py        # 标准样本V加载（读parquet，加载协方差逆矩阵M + 原始特征矩阵）
 ├── query.py                 # 单次查询核心 query_one() → PlanResult
 ├── continuity.py            # 输出端连续性（时间间隔重置 + 变化率限幅）
 ├── engine.py                # PlanningEngine 类（组装模块，持有V+模型）
 ├── batch.py                 # 批量驱动 run_batch()：逐行查询 + parquet输出
 ├── schemas.py               # 列名前缀常量 + PlanResult dataclass
-├── train_residual.py        # 残差特征训练模块（训练 + 向量数据库 + 归一化参数）
+├── train_residual.py        # 残差特征训练模块（训练 + 向量数据库 + 协方差矩阵）
 ├── dtw_query.py             # DTW 时序查询核心（独立查询路径）
 ├── weight_comparison_eval_dtw.py  # DTW 评估脚本（同 weight_comparison_eval.py 功能）
 ├── validate_visual_dtw.py   # DTW 可视化验证脚本（同 validate_visual.py 功能）
@@ -31,12 +31,13 @@ plan_center/
 
 ## 核心设计决策
 
-1. **归一化策略**：训练时计算全局 median/IQR，保存为 `norm_stats.json`，查询时加载使用
-2. **主汽流量**：权重为 0，作为硬门控（偏差超阈值直接筛掉）
-3. **残差特征**：6个 HistGradientBoostingRegressor，每个目标一个模型
-4. **相似度**：加权余弦 `(cos+1)/2 ∈ [0,1]`，归一化采用 robust 方法 `(x - median) / IQR`
-5. **聚类**：complete-link agglomerative，`distance = 1 - similarity`
+1. **相似度度量**：加权马氏距离 + 柯西核映射。距离 `d²(q,x) = (q-x)ᵀ·M·(q-x)`，其中 `M = W^{1/2}·Σ⁻¹·W^{1/2}`；相似度 `S = 1/(1+d²) ∈ (0,1]`。**无归一化**——通过协方差逆矩阵白化特征空间
+2. **权重语义**：权重=0 的特征（主汽流量、吨煤产气量、热值）在 `M` 中对应行列为 0，不参与距离；权重大的特征在 `M` 中被放大，使该特征差异对距离贡献增大
+3. **主汽流量**：权重为 0，作为硬门控（偏差超阈值直接筛掉）
+4. **残差特征**：6个 HistGradientBoostingRegressor，每个目标一个模型
+5. **协方差矩阵**：训练时计算并保存为 `covariance.json`，正则化 `Σ_reg = Σ + λ·mean(diag(Σ))·I`（λ=1e-6）+ 伪逆 `np.linalg.pinv` 求逆
 6. **规划中心**：模式1=最佳单样本，模式2=Top-k加权平均
+7. **DTW 路径独立**：DTW 时序查询仍用旧加权余弦函数（`similarity.py` 中保留），不受马氏距离改动影响
 
 ## 快速开始
 
@@ -56,14 +57,24 @@ pip install pandas numpy scikit-learn joblib pyyaml plotly
 ### 3. 第一步：训练残差模型 + 构建向量数据库
 
 ```bash
+# 默认训练（使用 defaults.yaml 配置）
 python -m plan_center.train_residual
+
+# 按截止日期过滤训练数据（只保留 < cutoff_date 的样本，避免数据泄露）
+python -m plan_center.train_residual --cutoff-date 2026-05-11
 ```
+
+**命令行参数**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--cutoff-date` | None | 截止日期（如 `2026-05-11`），只保留此日期之前的样本。不传则不过滤 |
 
 **输入**：稳定工况 parquet（只有原始特征 + 效率，无 resid_* 列）
 **输出**（保存在 `defaults.yaml → train.output_dir`）：
 - `vector_db.parquet` — 向量数据库（原始特征 + resid_* + 效率 + 身份列）
 - `residual_models/residual_model_*.joblib` — 6个残差模型
-- `norm_stats.json` — 归一化参数（15维特征的 median/IQR）
+- `covariance.json` — 15×15 加权协方差逆矩阵 `M`（马氏距离用）
 - `model_report.csv` / `residual_report.csv` — 训练报告
 
 **配置**（`defaults.yaml → train` 段）：
@@ -116,7 +127,7 @@ flow_gate:     # 硬门控配置
 paths:         # 路径配置
   stable_parquet: "向量数据库路径"
   residual_model_dir: "残差模型目录"
-  norm_stats_path: "归一化参数路径（norm_stats.json）"
+  covariance_path: "协方差逆矩阵路径（covariance.json）"
   query_parquet: "查询数据路径"
   cache_path: null   # 缓存路径（null=不缓存）
 ```
@@ -135,6 +146,8 @@ paths:         # 路径配置
 原始稳定工况数据 (#4_final_stable_df_mean_3_4_02.parquet)
     ↓ load_stable_data()
 DataFrame（含原始特征 + 效率）
+    ↓ filter_by_cutoff_date()（可选，--cutoff-date 参数）
+按截止日期过滤后的 DataFrame
     ↓ 合理工况筛选（可选）
 筛选后 DataFrame
     ↓ 分层抽样（可选）
@@ -143,24 +156,29 @@ DataFrame（含原始特征 + 效率）
 6个残差模型（HistGradientBoostingRegressor）
     ↓ 5-fold OOF 预测
 DataFrame（增加 resid_* 列）
-    ↓ 计算归一化参数（median/IQR，15维特征）
+    ↓ 计算加权协方差逆矩阵 M（15维特征）
     ↓ 保留必要列
 vector_db.parquet（原始特征 + resid_* + 效率 + 身份列）
     ↓ save_outputs()
-输出：vector_db.parquet + residual_models/ + norm_stats.json + model_report.csv
+输出：vector_db.parquet + residual_models/ + covariance.json + model_report.csv
 ```
 
 **关键函数**：
 - `load_stable_data()` — 读取数据，应用列别名，可选排除最后一个月
+- `filter_by_cutoff_date()` — 按截止日期过滤（`--cutoff-date` 参数触发）
 - `train_residual_models()` — 训练 6 个 HistGradientBoostingRegressor，5-fold OOF
-- `compute_norm_stats()` — 计算所有相似度特征的 median/IQR
-- `save_outputs()` — 保存向量数据库、模型、归一化参数
+- `compute_and_save_covariance()` — 计算 15 维特征的协方差矩阵，正则化后加权求逆，保存为 `covariance.json`
+- `save_outputs()` — 保存向量数据库、模型、协方差矩阵
 
-**归一化参数**：训练阶段计算 15 维特征（9原始 + 6残差）的 median/IQR，保存为 `norm_stats.json`，查询时加载使用。
+**协方差矩阵**：训练阶段对 15 维特征（9原始 + 6残差）计算协方差矩阵 `Σ`，正则化 `Σ_reg = Σ + λ·mean(diag(Σ))·I`（λ=1e-6），然后加权求逆 `M = W^{1/2}·Σ_reg⁻¹·W^{1/2}`，保存为 `covariance.json`，查询时加载使用。
 
 **使用方式**：
 ```bash
+# 默认训练
 python -m plan_center.train_residual
+
+# 按截止日期过滤（只保留 < 2026-05-11 的样本）
+python -m plan_center.train_residual --cutoff-date 2026-05-11
 ```
 
 ---
@@ -177,8 +195,8 @@ vector_db.parquet
 DataFrame（9109行 × 20列）
     ↓ 列别名映射、数值转换、缺失值删除
 df_standard（DataFrame）
-    ↓ 加载归一化参数 norm_stats.json
-    ↓ 计算加权特征矩阵 xw_standard
+    ↓ 加载协方差逆矩阵 covariance.json
+    ↓ 提取原始特征矩阵 X_standard（未归一化）
     ↓ 提取列
 loads_standard（主汽流量数组）
 sim_feature_cols（特征列名列表）
@@ -189,8 +207,8 @@ StandardStore 实例
 
 **StandardStore 字段**：
 - `df_standard` — 完整 DataFrame（含 resid_* 和效率）
-- `xw_standard` — (N, D) 加权特征矩阵（归一化 + 加权后，用于相似度计算）
-- `norm_stats` — 归一化统计量 {col: {median, iqr, ...}}
+- `X_standard` — (N, D) 原始特征矩阵（未归一化，马氏距离直接使用）
+- `cov_inv_matrix` — (D, D) 加权协方差逆矩阵 `M`（从 `covariance.json` 加载）
 - `loads_standard` — 主汽流量数组，用于硬门控
 - `sim_feature_cols` — 15 个相似度特征列名（9 raw + 6 resid）
 - `eff_score_all` — 效率分位数 E（0~1）
@@ -199,47 +217,63 @@ StandardStore 实例
 
 **引用关系**：
 - 被 `engine.py` 调用（`build_standard_store()`）
-- 被 `query.py` 调用（访问 `df_standard`、`loads_standard`、`eff_score_all`）
+- 被 `query.py` 调用（访问 `df_standard`、`X_standard`、`cov_inv_matrix`、`loads_standard`、`eff_score_all`）
 
 ---
 
 ### D. similarity.py — 相似度计算
 
-**职责**：提供相似度相关的纯函数，包括归一化、加权、余弦相似度、硬门控。
+**职责**：提供相似度相关的纯函数。**稳定工况查询路径用马氏距离函数**；**DTW 路径仍用旧余弦函数**（保留不删）。
 
-**核心函数**：
+**核心函数 — 马氏距离（稳定工况查询路径用）**：
 
 | 函数 | 用途 |
 |------|------|
-| `robust_norm_stats(df, cols)` | 计算 median/IQR（训练时用） |
+| `compute_covariance_matrix(X, reg_lambda)` | 计算协方差矩阵 + 正则化 `Σ_reg = Σ + λ·mean(diag(Σ))·I` |
+| `weighted_cov_inv_matrix(cov, weights)` | 加权求逆 `M = W^{1/2}·Σ⁻¹·W^{1/2}`（伪逆） |
+| `mahalanobis_similarity(q, X, M)` | 马氏距离相似度 `S = 1/(1+d²)`，向量化二次型 |
+| `flow_gate_keep_mask(load_q, loads, gate)` | 主汽流量硬门控，返回布尔掩码 |
+| `weight_array(cols, weights)` | 生成权重向量 |
+| `pct_rank(values)` | 分位数归一化，映射到 [0,1]（用于效率得分 E） |
+
+**核心函数 — 旧余弦（DTW 路径用，保留不删）**：
+
+| 函数 | 用途 |
+|------|------|
+| `robust_norm_stats(df, cols)` | 计算 median/IQR |
 | `normalize_features(df, cols, stats)` | robust 归一化 `z = (x - median) / IQR` |
-| `weight_array(cols, weights)` | 生成归一化权重向量 |
 | `weighted_matrix(df, cols, stats, weights)` | 归一化 + 加权矩阵 |
 | `weighted_vector_1d(values, cols, stats, weights)` | 单条向量归一化 + 加权 |
 | `candidate_similarity(df, values, cols, stats, weights, override)` | 候选子集相似度 |
 | `cosine01(a, b)` | 加权余弦相似度，映射到 [0,1] |
-| `flow_gate_keep_mask(load_q, loads, gate)` | 主汽流量硬门控，返回布尔掩码 |
-| `pct_rank(values)` | 分位数归一化，映射到 [0,1]（用于效率得分 E） |
 
-**归一化流程**：
+**马氏距离计算流程**：
 
 ```
-标准样本 DataFrame（N 行 × 15 列）
-    ↓ robust_norm_stats()（训练时计算并保存）
-全局统计量 {col: {median, iqr}}
-    ↓ weighted_matrix()（加载时预计算）
-加权特征矩阵 xw_standard（N × 15）
-    ↓
-查询时：weighted_vector_1d(q_15d) → q_xw
-    ↓ cosine01(q_xw, xw_standard)
-余弦相似度数组 [0,1]^N
+训练阶段：
+原始特征矩阵 X（N × 15）
+    ↓ compute_covariance_matrix()
+协方差矩阵 Σ（15 × 15）+ 正则化
+    ↓ weighted_cov_inv_matrix(cov, weights)
+加权协方差逆矩阵 M = W^{1/2}·Σ⁻¹·W^{1/2}（15 × 15）
+    ↓ 保存为 covariance.json
+
+查询阶段：
+查询向量 q（15维）+ 标准样本矩阵 X_standard（N × 15）
+    ↓ mahalanobis_similarity(q, X_standard, M)
+    ↓   diff = X_standard - q
+    ↓   d² = einsum('ij,jk,ik->i', diff, M, diff)  # 向量化二次型
+    ↓   S = 1 / (1 + d²)  # 柯西核映射
+相似度数组 (0, 1]^N
 ```
 
 **引用关系**：
-- 被 `query.py` 调用（`weighted_vector_1d`、`cosine01`、`flow_gate_keep_mask`）
-- 被 `run_10day_sample.py` 调用
-- 被 `run_once.py` 调用
-- 被 `standard_store.py` 调用（`robust_norm_stats`、`weighted_matrix`、`pct_rank`）
+- 被 `query.py` 调用（`mahalanobis_similarity`、`flow_gate_keep_mask`）
+- 被 `run_10day_sample.py` 调用（`mahalanobis_similarity`、`flow_gate_keep_mask`）
+- 被 `run_once.py` 调用（`mahalanobis_similarity`、`flow_gate_keep_mask`）
+- 被 `standard_store.py` 调用（`compute_covariance_matrix`、`weighted_cov_inv_matrix`、`weight_array`、`pct_rank`）
+- 被 `train_residual.py` 调用（`compute_covariance_matrix`、`weighted_cov_inv_matrix`、`weight_array`）
+- 被 DTW 路径调用（`cosine01`、`robust_norm_stats`、`normalize_features`、`weighted_matrix`、`weighted_vector_1d`）
 
 ---
 
@@ -278,10 +312,8 @@ StandardStore 实例
 raw_features（dict，9维原始特征）
     ↓ make_query_vector_15d()
 q_15d（15维查询向量）
-    ↓ weighted_vector_1d()（使用全局 norm_stats）
-q_xw（加权查询向量）
-    ↓ cosine01(q_xw, store.xw_standard)
-s_all（N 维相似度数组）
+    ↓ mahalanobis_similarity(q_15d, store.X_standard, store.cov_inv_matrix)
+s_all（N 维相似度数组，柯西核 S=1/(1+d²)）
     ↓ flow_gate_keep_mask()
 valid_pos（候选样本索引，M 条）
     ↓ D = a*S + b*E
@@ -298,16 +330,15 @@ PlanResult（规划中心 + 诊断信息）
 
 **执行顺序**：
 1. 构建 15 维查询向量
-2. 使用全局 norm_stats 归一化 + 加权查询向量
-3. 与预计算的 xw_standard 计算余弦相似度
-4. 硬门控筛选候选（负荷 ±15 t/h）
-5. D = a*S + b*E
-6. Top-k 排序，映射回原始索引
-7. 填充 PlanResult
+2. 用预计算的加权协方差逆矩阵 `M` 计算马氏距离相似度（柯西核映射）
+3. 硬门控筛选候选（负荷 ±15 t/h）
+4. D = a*S + b*E
+5. Top-k 排序，映射回原始索引
+6. 填充 PlanResult
 
 **引用关系**：
 - 调用 `features.make_query_vector_15d()`
-- 调用 `similarity.weighted_vector_1d()`、`cosine01()`、`flow_gate_keep_mask()`
+- 调用 `similarity.mahalanobis_similarity()`、`flow_gate_keep_mask()`
 - 调用 `continuity.apply_output_continuity()`（在 `query_one_full` 中）
 - 被 `engine.py` 调用
 
@@ -406,9 +437,9 @@ output_parquet
 |------|----------------------------------|---------------------------|
 | 数据源 | `vector_db.parquet`（稳定工况，~9k行） | `#4_df_all_1min.parquet`（分钟级全量，~67万行） |
 | 查询向量 | 单点（15维：9原始+6残差） | 时序片段（5分钟×15维=15×5矩阵） |
-| 相似度计算 | 加权余弦 `(cos+1)/2` | DTW对齐后逐对加权余弦均值 |
+| 相似度计算 | 加权马氏距离（柯西核 `S=1/(1+d²)`） | DTW对齐后逐对加权余弦均值 |
 | 匹配方式 | Top-k 最近邻 | DTW最短路径 + Top-k |
-| 标准化 | 候选子集动态 median/IQR | 3天全局参考窗口 median/IQR |
+| 标准化 | 无归一化，协方差矩阵白化 | 3天全局参考窗口 median/IQR |
 | 输出 | 规划中心 | 规划中心 |
 | 连续性处理 | 支持 | 暂不支持（独立查询路径） |
 
@@ -716,7 +747,7 @@ python -m plan_center.run_once --row-index 0 --output result.csv --top-k 5
 
 **引用关系**：
 - 调用 `engine.plan_one_no_continuity()`
-- 调用 `similarity.candidate_similarity()`（展示用重新计算）
+- 调用 `similarity.mahalanobis_similarity()`、`flow_gate_keep_mask()`（展示用重新计算）
 
 ---
 
@@ -733,36 +764,38 @@ python -m plan_center.run_10day_sample.py --days 10 --points-per-day 10 --random
 
 ---
 
-## 归一化流程（当前）
+## 相似度计算流程（当前）
 
 ### 训练阶段
 
-`train_residual.py` 计算所有相似度特征（9原始 + 6残差 = 15维）的 median/IQR，保存为 `norm_stats.json`。
+`train_residual.py` 计算 15 维相似度特征（9原始 + 6残差）的协方差矩阵，正则化后加权求逆，保存为 `covariance.json`。
 
 ```
-原始数据 → 残差模型训练 → resid_* 列生成 → compute_norm_stats() → norm_stats.json
+原始数据 → 残差模型训练 → resid_* 列生成 → compute_and_save_covariance() → covariance.json
+                                                       ↓
+                              Σ（15×15）→ 正则化 → M = W^{1/2}·Σ⁻¹·W^{1/2}
 ```
 
-### 查询阶段（全局归一化）
+### 查询阶段（马氏距离 + 柯西核）
 
 ```
 加载阶段：
-vector_db.parquet + norm_stats.json
+vector_db.parquet + covariance.json
     ↓
-robust_norm_stats 已保存 → 加载 norm_stats
+提取原始特征矩阵 X_standard（N × 15，未归一化）
     ↓
-weighted_matrix(df_standard, ..., norm_stats, weights)
+加载加权协方差逆矩阵 M（15 × 15）
     ↓
-xw_standard（N × 15 预计算加权矩阵，常驻内存）
+StandardStore（X_standard + M 常驻内存）
 
 查询阶段：
-查询向量 q_15d
+查询向量 q_15d（15维）
     ↓
-weighted_vector_1d(q_15d, ..., norm_stats, weights)
-    ↓
-q_xw（加权查询向量）
-    ↓
-cosine01(q_xw, xw_standard) → 相似度 [0,1]
+mahalanobis_similarity(q_15d, X_standard, M)
+    ↓   diff = X_standard - q
+    ↓   d² = einsum('ij,jk,ik->i', diff, M, diff)  # 向量化二次型
+    ↓   S = 1 / (1 + d²)  # 柯西核映射到 (0, 1]
+相似度数组 [0,1]^N
     ↓
 硬门控筛选 + Top-k 排序
 ```
@@ -782,21 +815,20 @@ cosine01(q_xw, xw_standard) → 相似度 [0,1]
     ↓
 vector_db.parquet（原始特征 + resid_* + 效率）
 residual_models/（6个 .joblib）
-norm_stats.json（15维特征 median/IQR）
+covariance.json（15×15 加权协方差逆矩阵 M）
     ↓
                         查询阶段
 查询数据 (#4_df_all_1min.parquet)
     ↓
-[engine.py] PlanningEngine 加载 vector_db + models + norm_stats
+[engine.py] PlanningEngine 加载 vector_db + models + covariance
     ↓
-[standard_store.py] 预计算 xw_standard（加权特征矩阵）
+[standard_store.py] 提取 X_standard（原始特征矩阵）+ 加载 M
     ↓
 [query.py] 单次查询：
   1. make_query_vector_15d() → 15维查询向量
-  2. weighted_vector_1d() → 加权查询向量
-  3. cosine01() → 与 xw_standard 计算相似度
-  4. flow_gate_keep_mask() → 硬门控筛选
-  5. Top-k 排序 → PlanResult
+  2. mahalanobis_similarity() → 与 X_standard 计算马氏距离相似度
+  3. flow_gate_keep_mask() → 硬门控筛选
+  4. Top-k 排序 → PlanResult
     ↓
 [continuity.py] 连续性处理 → final_plan_center
     ↓
@@ -825,9 +857,9 @@ norm_stats.json（15维特征 median/IQR）
 
 ## 常见问题
 
-### Q: 归一化参数如何生成和使用？
+### Q: 协方差矩阵如何生成和使用？
 
-A: 训练阶段由 `train_residual.py` 计算所有 15 维相似度特征（9原始 + 6残差）的 median/IQR，保存为 `norm_stats.json`。查询时由 `standard_store.py` 加载，预计算加权特征矩阵 `xw_standard`，查询向量也用同一套参数归一化。
+A: 训练阶段由 `train_residual.py` 对 15 维相似度特征（9原始 + 6残差）计算协方差矩阵 `Σ`，正则化 `Σ_reg = Σ + λ·mean(diag(Σ))·I`（λ=1e-6），加权求逆 `M = W^{1/2}·Σ_reg⁻¹·W^{1/2}`，保存为 `covariance.json`。查询时由 `standard_store.py` 加载 `M`，与原始特征矩阵 `X_standard` 一起用于马氏距离计算。**无归一化**——马氏距离通过 `M` 白化特征空间，不需要 median/IQR 归一化。
 
 ### Q: 候选集多大合适？
 
@@ -855,3 +887,18 @@ paths:
 train:
   input_parquet: "新原始数据路径"
 ```
+
+### Q: 如何按截止日期过滤训练数据？
+
+A: 使用 `--cutoff-date` 参数，只保留此日期之前的样本。常用于避免数据泄露（如验证 5月11日的查询效果时，确保向量数据库只用 5月11日以前的数据）：
+```bash
+python -m plan_center.train_residual --cutoff-date 2026-05-11
+```
+
+### Q: 马氏距离和余弦相似度的区别？
+
+A:
+- **余弦相似度**：衡量方向相似性，对量纲不敏感，但忽略特征间相关性
+- **马氏距离**：考虑特征间相关性 + 量纲，通过协方差逆矩阵白化特征空间。等价于在白化后的空间里算欧氏距离
+- **柯西核映射**：`S = 1/(1+d²)` 把距离 `d∈[0,+∞)` 映射到相似度 `S∈(0,1]`
+- **权重语义**：`M = W^{1/2}·Σ⁻¹·W^{1/2}`，权重大的特征对距离贡献增大；权重=0 的特征不参与距离（与余弦方案下"权重=0 不参与相似度"语义一致）
