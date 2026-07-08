@@ -12,7 +12,7 @@ from .config import PlanningConfig, build_feature_weights
 from .continuity import apply_output_continuity, has_valid_center, should_reset_continuity
 from .features import make_query_vector_15d
 from .schemas import PlanResult
-from .similarity import candidate_similarity, compute_and_normalize_candidates, cosine01, flow_gate_keep_mask, weighted_vector_1d
+from .similarity import cosine01, flow_gate_keep_mask, weighted_vector_1d
 from .standard_store import StandardStore
 
 
@@ -44,14 +44,29 @@ def query_one(
     match_cfg = cfg.matching
     gate_cfg = cfg.flow_gate
 
-    # 2. 构建查询向量
+    # 1. 15维查询向量
     try:
         q_15d = make_query_vector_15d(raw_features, models, feat)
     except Exception as e:
         result.match_status = f"查询特征异常: {e}"
         return result
 
-    # 3. 硬门控先筛选候选
+    # 2. 加权（用 store 的 norm_stats）
+    weights = build_feature_weights(feat)
+    try:
+        q_xw, _ = weighted_vector_1d(q_15d, store.sim_feature_cols, store.norm_stats, weights)
+    except Exception as e:
+        result.match_status = f"加权失败: {e}"
+        return result
+
+    # NaN 保护：将 NaN/Inf 替换为 0
+    q_xw = np.nan_to_num(q_xw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 3. 余弦相似度
+    q_xw_2d = q_xw.reshape(1, -1)
+    s_all = cosine01(q_xw_2d, store.xw_standard)[0]
+
+    # 4. 硬门控
     raw_dict = raw_features if isinstance(raw_features, dict) else dict(raw_features)
     q_load = float(raw_dict.get(feat.load_col, 0.0))
     keep_mask = flow_gate_keep_mask(q_load, store.loads_standard, gate_cfg)
@@ -61,32 +76,21 @@ def query_one(
         if not match_cfg.allow_fallback_nearest_load:
             result.match_status = "无样本通过负荷硬门控"
             return result
+        # 兜底：按最近负荷取 Top-k
         valid_pos = np.argsort(np.abs(store.loads_standard - q_load))[:min(match_cfg.top_k, len(store.loads_standard))]
+        s_all = s_all.copy()
+        s_all[valid_pos] = 0.0  # 兜底样本相似度置0，避免误判
         result.match_status = "负荷硬门控未命中，按最近负荷兜底"
     else:
         result.match_status = "正常匹配"
 
-    # 4. 提取候选子集，动态计算候选集归一化参数并做相似度
-    df_candidates = store.df_standard.iloc[valid_pos]
-    weights = build_feature_weights(feat)
-    global_norm_stats = getattr(store, 'norm_stats', None)
-    s_candidates, effective_norm_stats, norm_source = compute_and_normalize_candidates(
-        df_candidates, q_15d, store.sim_feature_cols, weights, global_norm_stats
-    )
-
-    # NaN 检查：如有 NaN，用均值填充
-    if np.any(np.isnan(s_candidates)):
-        nan_mask = np.isnan(s_candidates)
-        mean_val = np.nanmean(s_candidates)
-        s_candidates = np.where(nan_mask, mean_val, s_candidates)
-
-    # 5. D = a*S + b*E（仅候选子集）
-    d_candidates = match_cfg.d_weight_s * s_candidates + match_cfg.d_weight_e * store.eff_score_all[valid_pos]
+    # 5. D = a*S + b*E（无 F）
+    d_all = match_cfg.d_weight_s * s_all + match_cfg.d_weight_e * store.eff_score_all
 
     # 6. Top-k by D
-    order = np.argsort(d_candidates)[::-1]
-    top_pos_local = order[:min(match_cfg.top_k, len(order))]
-    top_pos = valid_pos[top_pos_local]
+    d_valid = d_all[valid_pos]
+    order = np.argsort(d_valid)[::-1]
+    top_pos = valid_pos[order[:min(match_cfg.top_k, len(order))]]
 
     if len(top_pos) == 0:
         result.match_status += "；无有效候选样本"
@@ -95,10 +99,10 @@ def query_one(
     result.topk_indices = top_pos.tolist()
     result.topk_count = len(top_pos)
     result.best_index = int(top_pos[0])
-    result.similarity_best = _nan_safe(s_candidates[top_pos_local[0]])
-    result.similarity_topk_mean = _nan_safe(np.nanmean(s_candidates[top_pos_local]))
-    result.score_d_best = _nan_safe(d_candidates[top_pos_local[0]])
-    result.score_d_topk_mean = _nan_safe(np.nanmean(d_candidates[top_pos_local]))
+    result.similarity_best = _nan_safe(s_all[top_pos[0]])
+    result.similarity_topk_mean = _nan_safe(np.nanmean(s_all[top_pos]))
+    result.score_d_best = _nan_safe(d_all[top_pos[0]])
+    result.score_d_topk_mean = _nan_safe(np.nanmean(d_all[top_pos]))
     result.eff_score_best = _nan_safe(store.eff_score_all[top_pos[0]])
     result.eff_topk_mean = _nan_safe(
         store.df_standard.iloc[top_pos][feat.eff_col].astype(float).mean()
@@ -130,7 +134,7 @@ def query_one(
             # Top-k 加权/算术平均
             top_df = store.df_standard.iloc[top_pos]
             if match_cfg.topk_avg_method == "weighted":
-                weights_d = np.clip(d_candidates[top_pos_local], 0.001, None)
+                weights_d = np.clip(d_all[top_pos], 0.001, None)
                 center_vals = {}
                 for c in feat.plan_center_cols:
                     vals = top_df[c].astype(float).values

@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .config import PlanningConfig, build_feature_weights
-from .similarity import robust_norm_stats, pct_rank
+from .similarity import robust_norm_stats, weighted_matrix, pct_rank
 
 
 # =========================
@@ -31,7 +31,9 @@ class StandardStore:
     """加载并预处理后的标准样本 V。"""
 
     df_standard: pd.DataFrame          # N 行标准样本（已含 resid_* 和锅炉效率列）
+    xw_standard: np.ndarray            # (N, D) 加权特征矩阵
     loads_standard: np.ndarray         # (N,) 主汽流量
+    norm_stats: dict                   # 归一化统计量 {col: {median, iqr, ...}}
     sim_feature_cols: list[str]        # D 个相似度特征列名（raw + residual）
     eff_score_all: np.ndarray          # (N,) 效率分位数 E
 
@@ -89,6 +91,9 @@ def build_cache_signature(cfg: PlanningConfig) -> dict:
         "eff_col": cfg.features.eff_col,
         "load_col": cfg.features.load_col,
     }
+    # 归一化参数路径也纳入签名
+    if cfg.paths.norm_stats_path:
+        sig["norm_stats_path"] = str(cfg.paths.norm_stats_path)
     return sig
 
 
@@ -181,14 +186,32 @@ def build_standard_store(cfg: PlanningConfig) -> StandardStore:
     df = df.dropna(subset=required_cols).reset_index(drop=True)
     print(f"标准样本数量: {len(df)}")
 
-    # 4. 效率分位数 E
+    # 4. 归一化统计量（优先从文件加载）
+    if cfg.paths.norm_stats_path and Path(cfg.paths.norm_stats_path).exists():
+        with open(cfg.paths.norm_stats_path, "r", encoding="utf-8") as f:
+            norm_stats = json.load(f)
+        print(f"从文件加载归一化参数: {cfg.paths.norm_stats_path}")
+    else:
+        # 兼容旧逻辑：如果没有保存的归一化参数，则自己计算
+        norm_stats = robust_norm_stats(df, sim_feature_cols)
+        print("未找到归一化参数文件，使用数据计算")
+
+    # 5. 加权特征矩阵（含 NaN 保护）
+    weights = build_feature_weights(feat)
+    xw_standard, _ = weighted_matrix(df, sim_feature_cols, norm_stats, weights)
+    # NaN 保护：将加权矩阵中的 NaN/Inf 替换为 0，避免后续 cosine_similarity 报错
+    xw_standard = np.nan_to_num(xw_standard, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 6. 效率分位数 E
     eff_score_all = pct_rank(df[feat.eff_col].values.astype(float))
 
     loads_standard = df[feat.load_col].values.astype(float)
 
     store = StandardStore(
         df_standard=df,
+        xw_standard=xw_standard.astype(np.float32),
         loads_standard=loads_standard.astype(np.float32),
+        norm_stats=norm_stats,
         sim_feature_cols=sim_feature_cols,
         eff_score_all=eff_score_all.astype(np.float32),
     )

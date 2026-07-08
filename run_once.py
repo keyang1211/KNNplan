@@ -90,15 +90,18 @@ def main():
     # 5. 构建 Top-K 输出
     print(f"\n[5] 构建 Top-{args.top_k} 输出...")
 
-    # 重新计算 S 和 D（候选子集动态归一化方式）
+    # 重新计算完整 S 和 D（取 Top-K）
     from plan_center.features import make_query_vector_15d
     from plan_center.config import build_feature_weights
-    from plan_center.similarity import candidate_similarity, compute_and_normalize_candidates, flow_gate_keep_mask
+    from plan_center.similarity import weighted_vector_1d, cosine01
 
     q_15d = make_query_vector_15d(raw_features, engine.models, engine.cfg.features)
     weights = build_feature_weights(engine.cfg.features)
+    q_xw, _ = weighted_vector_1d(q_15d, engine.store.sim_feature_cols, engine.store.norm_stats, weights)
+    s_all = cosine01(q_xw.reshape(1, -1), engine.store.xw_standard)[0]
 
-    # 硬门控先筛选候选
+    # 硬门控
+    from plan_center.similarity import flow_gate_keep_mask
     q_load = float(raw_features.get(engine.cfg.features.load_col, 0.0))
     keep_mask = flow_gate_keep_mask(q_load, engine.store.loads_standard, engine.cfg.flow_gate)
     valid_pos = np.where(keep_mask)[0]
@@ -107,25 +110,16 @@ def main():
         print("无样本通过硬门控，回退到最近负荷")
         valid_pos = np.argsort(np.abs(engine.store.loads_standard - q_load))[:args.top_k]
 
-    df_candidates = engine.store.df_standard.iloc[valid_pos]
-    global_norm_stats = getattr(engine.store, 'norm_stats', None)
-    s_candidates, effective_norm_stats, norm_source = compute_and_normalize_candidates(
-        df_candidates, q_15d, engine.store.sim_feature_cols, weights, global_norm_stats
-    )
-    if np.any(np.isnan(s_candidates)):
-        nan_mask = np.isnan(s_candidates)
-        mean_val = np.nanmean(s_candidates)
-        s_candidates = np.where(nan_mask, mean_val, s_candidates)
-
-    d_candidates = engine.cfg.matching.d_weight_s * s_candidates + engine.cfg.matching.d_weight_e * engine.store.eff_score_all[valid_pos]
-    d_valid = d_candidates
+    # D = a*S + b*E
+    d_all = engine.cfg.matching.d_weight_s * s_all + engine.cfg.matching.d_weight_e * engine.store.eff_score_all
+    d_valid = d_all[valid_pos]
     order = np.argsort(d_valid)[::-1][:args.top_k]
     top_pos = valid_pos[order]
 
     top_indices = top_pos.tolist()
-    top_s = s_candidates[order][:args.top_k]
-    top_d = d_candidates[order][:args.top_k]
-    top_e = engine.store.eff_score_all[top_pos]
+    top_s = s_all[top_indices]
+    top_d = d_all[top_indices]
+    top_e = engine.store.eff_score_all[top_indices]
     top_df = engine.store.df_standard.iloc[top_indices].copy()
 
     # 选择输出列

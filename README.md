@@ -7,15 +7,15 @@ plan_center/
 ├── __init__.py              # 包入口，导出主要类和函数
 ├── config.py                # 配置 dataclass + load_config(yaml)
 ├── defaults.yaml            # 默认配置文件（所有参数集中在此）
-├── similarity.py            # 相似度计算纯函数（归一化、加权余弦、硬门控、动态候选归一化）
+├── similarity.py            # 相似度计算纯函数（归一化、加权余弦、硬门控）
 ├── features.py              # 残差模型加载 + 残差特征计算（9原→15维）
-├── standard_store.py        # 标准样本V加载（读parquet，不预归一化）
+├── standard_store.py        # 标准样本V加载（读parquet，预计算加权特征矩阵）
 ├── query.py                 # 单次查询核心 query_one() → PlanResult
 ├── continuity.py            # 输出端连续性（时间间隔重置 + 变化率限幅）
 ├── engine.py                # PlanningEngine 类（组装模块，持有V+模型）
 ├── batch.py                 # 批量驱动 run_batch()：逐行查询 + parquet输出
 ├── schemas.py               # 列名前缀常量 + PlanResult dataclass
-├── train_residual.py        # 残差特征训练模块（训练 + 向量数据库，不计算归一化参数）
+├── train_residual.py        # 残差特征训练模块（训练 + 向量数据库 + 归一化参数）
 ├── dtw_query.py             # DTW 时序查询核心（独立查询路径）
 ├── weight_comparison_eval_dtw.py  # DTW 评估脚本（同 weight_comparison_eval.py 功能）
 ├── validate_visual_dtw.py   # DTW 可视化验证脚本（同 validate_visual.py 功能）
@@ -31,7 +31,7 @@ plan_center/
 
 ## 核心设计决策
 
-1. **归一化策略**：查询时动态计算候选子集的 median/IQR，不使用全局归一化参数
+1. **归一化策略**：训练时计算全局 median/IQR，保存为 `norm_stats.json`，查询时加载使用
 2. **主汽流量**：权重为 0，作为硬门控（偏差超阈值直接筛掉）
 3. **残差特征**：6个 HistGradientBoostingRegressor，每个目标一个模型
 4. **相似度**：加权余弦 `(cos+1)/2 ∈ [0,1]`，归一化采用 robust 方法 `(x - median) / IQR`
@@ -59,13 +59,12 @@ pip install pandas numpy scikit-learn joblib pyyaml plotly
 python -m plan_center.train_residual
 ```
 
-**输入**：稳定工况 parquet（只有原始特征 + 效率，无 resid_* 列）  
+**输入**：稳定工况 parquet（只有原始特征 + 效率，无 resid_* 列）
 **输出**（保存在 `defaults.yaml → train.output_dir`）：
 - `vector_db.parquet` — 向量数据库（原始特征 + resid_* + 效率 + 身份列）
 - `residual_models/residual_model_*.joblib` — 6个残差模型
+- `norm_stats.json` — 归一化参数（15维特征的 median/IQR）
 - `model_report.csv` / `residual_report.csv` — 训练报告
-
-**注意**：训练阶段不再计算归一化参数，归一化改为查询时动态计算候选子集的统计量。
 
 **配置**（`defaults.yaml → train` 段）：
 ```yaml
@@ -117,6 +116,7 @@ flow_gate:     # 硬门控配置
 paths:         # 路径配置
   stable_parquet: "向量数据库路径"
   residual_model_dir: "残差模型目录"
+  norm_stats_path: "归一化参数路径（norm_stats.json）"
   query_parquet: "查询数据路径"
   cache_path: null   # 缓存路径（null=不缓存）
 ```
@@ -143,18 +143,20 @@ DataFrame（含原始特征 + 效率）
 6个残差模型（HistGradientBoostingRegressor）
     ↓ 5-fold OOF 预测
 DataFrame（增加 resid_* 列）
+    ↓ 计算归一化参数（median/IQR，15维特征）
     ↓ 保留必要列
 vector_db.parquet（原始特征 + resid_* + 效率 + 身份列）
     ↓ save_outputs()
-输出：vector_db.parquet + residual_models/ + model_report.csv
+输出：vector_db.parquet + residual_models/ + norm_stats.json + model_report.csv
 ```
 
 **关键函数**：
 - `load_stable_data()` — 读取数据，应用列别名，可选排除最后一个月
 - `train_residual_models()` — 训练 6 个 HistGradientBoostingRegressor，5-fold OOF
-- `save_outputs()` — 保存向量数据库和模型
+- `compute_norm_stats()` — 计算所有相似度特征的 median/IQR
+- `save_outputs()` — 保存向量数据库、模型、归一化参数
 
-**注意**：训练阶段**不再计算**归一化参数，归一化改为查询时动态计算。
+**归一化参数**：训练阶段计算 15 维特征（9原始 + 6残差）的 median/IQR，保存为 `norm_stats.json`，查询时加载使用。
 
 **使用方式**：
 ```bash
@@ -175,6 +177,8 @@ vector_db.parquet
 DataFrame（9109行 × 20列）
     ↓ 列别名映射、数值转换、缺失值删除
 df_standard（DataFrame）
+    ↓ 加载归一化参数 norm_stats.json
+    ↓ 计算加权特征矩阵 xw_standard
     ↓ 提取列
 loads_standard（主汽流量数组）
 sim_feature_cols（特征列名列表）
@@ -185,11 +189,11 @@ StandardStore 实例
 
 **StandardStore 字段**：
 - `df_standard` — 完整 DataFrame（含 resid_* 和效率）
+- `xw_standard` — (N, D) 加权特征矩阵（归一化 + 加权后，用于相似度计算）
+- `norm_stats` — 归一化统计量 {col: {median, iqr, ...}}
 - `loads_standard` — 主汽流量数组，用于硬门控
 - `sim_feature_cols` — 15 个相似度特征列名（9 raw + 6 resid）
 - `eff_score_all` — 效率分位数 E（0~1）
-
-**注意**：`StandardStore` 不再存储 `norm_stats` 或 `xw_standard`，归一化在查询时动态计算。
 
 **缓存**：支持 joblib 缓存，签名不匹配时自动重建。
 
@@ -201,7 +205,7 @@ StandardStore 实例
 
 ### D. similarity.py — 相似度计算
 
-**职责**：提供相似度相关的纯函数，包括归一化、加权、余弦相似度、硬门控、动态候选归一化。
+**职责**：提供相似度相关的纯函数，包括归一化、加权、余弦相似度、硬门控。
 
 **核心函数**：
 
@@ -212,35 +216,30 @@ StandardStore 实例
 | `weight_array(cols, weights)` | 生成归一化权重向量 |
 | `weighted_matrix(df, cols, stats, weights)` | 归一化 + 加权矩阵 |
 | `weighted_vector_1d(values, cols, stats, weights)` | 单条向量归一化 + 加权 |
-| `candidate_similarity(df, values, cols, stats, weights, override)` | 候选子集相似度（支持动态统计量） |
-| `compute_norm_stats_from_df(df, cols)` | **新增**：从 DataFrame 动态计算 median/IQR |
-| `compute_and_normalize_candidates(df, values, cols, weights, global_stats, min)` | **新增**：动态归一化 + 相似度 + 回退 |
+| `candidate_similarity(df, values, cols, stats, weights, override)` | 候选子集相似度 |
 | `cosine01(a, b)` | 加权余弦相似度，映射到 [0,1] |
 | `flow_gate_keep_mask(load_q, loads, gate)` | 主汽流量硬门控，返回布尔掩码 |
 | `pct_rank(values)` | 分位数归一化，映射到 [0,1]（用于效率得分 E） |
 
-**动态归一化流程**：
+**归一化流程**：
 
 ```
-候选子集 DataFrame（M 行 × 15 列）
-    ↓ compute_norm_stats_from_df()
-候选集统计量 {col: {median, iqr}}
-    ↓ weighted_matrix() + weighted_vector_1d()
-归一化 + 加权后的候选矩阵 + 查询向量
-    ↓ cosine01()
-余弦相似度数组 [0,1]^M
+标准样本 DataFrame（N 行 × 15 列）
+    ↓ robust_norm_stats()（训练时计算并保存）
+全局统计量 {col: {median, iqr}}
+    ↓ weighted_matrix()（加载时预计算）
+加权特征矩阵 xw_standard（N × 15）
+    ↓
+查询时：weighted_vector_1d(q_15d) → q_xw
+    ↓ cosine01(q_xw, xw_standard)
+余弦相似度数组 [0,1]^N
 ```
-
-**回退逻辑**：
-- 候选集 >= 5 条：使用候选集动态统计量
-- 候选集 < 5 条 + 全局统计存在：回退全局统计
-- 候选集 < 5 条 + 全局统计不存在：仍使用候选集统计量
 
 **引用关系**：
-- 被 `query.py` 调用（`compute_and_normalize_candidates`）
+- 被 `query.py` 调用（`weighted_vector_1d`、`cosine01`、`flow_gate_keep_mask`）
 - 被 `run_10day_sample.py` 调用
 - 被 `run_once.py` 调用
-- 被 `standard_store.py` 调用（`robust_norm_stats`、`pct_rank`）
+- 被 `standard_store.py` 调用（`robust_norm_stats`、`weighted_matrix`、`pct_rank`）
 
 ---
 
@@ -279,12 +278,12 @@ StandardStore 实例
 raw_features（dict，9维原始特征）
     ↓ make_query_vector_15d()
 q_15d（15维查询向量）
+    ↓ weighted_vector_1d()（使用全局 norm_stats）
+q_xw（加权查询向量）
+    ↓ cosine01(q_xw, store.xw_standard)
+s_all（N 维相似度数组）
     ↓ flow_gate_keep_mask()
 valid_pos（候选样本索引，M 条）
-    ↓ df_candidates = store.df_standard.iloc[valid_pos]
-候选子集 DataFrame（M × 15）
-    ↓ compute_and_normalize_candidates()
-s_candidates（M 维相似度数组）
     ↓ D = a*S + b*E
 d_candidates（M 维匹配度数组）
     ↓ argsort + top-k
@@ -299,17 +298,16 @@ PlanResult（规划中心 + 诊断信息）
 
 **执行顺序**：
 1. 构建 15 维查询向量
-2. 硬门控筛选候选（负荷 ±15 t/h）
-3. 动态计算候选集归一化参数
-4. 归一化候选集 + 查询向量
-5. 计算余弦相似度
-6. D = a*S + b*E
-7. Top-k 排序，映射回原始索引
-8. 填充 PlanResult
+2. 使用全局 norm_stats 归一化 + 加权查询向量
+3. 与预计算的 xw_standard 计算余弦相似度
+4. 硬门控筛选候选（负荷 ±15 t/h）
+5. D = a*S + b*E
+6. Top-k 排序，映射回原始索引
+7. 填充 PlanResult
 
 **引用关系**：
 - 调用 `features.make_query_vector_15d()`
-- 调用 `similarity.compute_and_normalize_candidates()`、`flow_gate_keep_mask()`
+- 调用 `similarity.weighted_vector_1d()`、`cosine01()`、`flow_gate_keep_mask()`
 - 调用 `continuity.apply_output_continuity()`（在 `query_one_full` 中）
 - 被 `engine.py` 调用
 
@@ -718,7 +716,7 @@ python -m plan_center.run_once --row-index 0 --output result.csv --top-k 5
 
 **引用关系**：
 - 调用 `engine.plan_one_no_continuity()`
-- 调用 `similarity.compute_and_normalize_candidates()`（展示用重新计算）
+- 调用 `similarity.candidate_similarity()`（展示用重新计算）
 
 ---
 
@@ -739,36 +737,37 @@ python -m plan_center.run_10day_sample.py --days 10 --points-per-day 10 --random
 
 ### 训练阶段
 
-`train_residual.py` **不再计算**归一化参数。
+`train_residual.py` 计算所有相似度特征（9原始 + 6残差 = 15维）的 median/IQR，保存为 `norm_stats.json`。
 
 ```
-原始数据 → 残差模型训练 → 向量数据库 parquet（仅存原始值）
+原始数据 → 残差模型训练 → resid_* 列生成 → compute_norm_stats() → norm_stats.json
 ```
 
-### 查询阶段（动态归一化）
+### 查询阶段（全局归一化）
 
 ```
+加载阶段：
+vector_db.parquet + norm_stats.json
+    ↓
+robust_norm_stats 已保存 → 加载 norm_stats
+    ↓
+weighted_matrix(df_standard, ..., norm_stats, weights)
+    ↓
+xw_standard（N × 15 预计算加权矩阵，常驻内存）
+
+查询阶段：
 查询向量 q_15d
     ↓
-硬门控筛选候选（负荷 ±15 t/h）
+weighted_vector_1d(q_15d, ..., norm_stats, weights)
     ↓
-提取候选子集 df_candidates（M 行）
+q_xw（加权查询向量）
     ↓
-compute_norm_stats_from_df(df_candidates)
+cosine01(q_xw, xw_standard) → 相似度 [0,1]
     ↓
-候选集 median/IQR（15 维）
-    ↓
-weighted_matrix(df_candidates) + weighted_vector_1d(q_15d)
-    ↓
-归一化 + 加权后的矩阵/向量
-    ↓
-cosine01() → 相似度 [0,1]
-    ↓
-Top-k 排序
+硬门控筛选 + Top-k 排序
 ```
 
-**回退逻辑**：
-- 候选集 < 5 条：回退全局统计（如果存在 `norm_stats.json`）
+**兜底逻辑**：
 - 无候选通过门控：按最近负荷兜底
 
 ---
@@ -783,17 +782,21 @@ Top-k 排序
     ↓
 vector_db.parquet（原始特征 + resid_* + 效率）
 residual_models/（6个 .joblib）
+norm_stats.json（15维特征 median/IQR）
     ↓
                         查询阶段
 查询数据 (#4_df_all_1min.parquet)
     ↓
-[engine.py] PlanningEngine 加载 vector_db + models
+[engine.py] PlanningEngine 加载 vector_db + models + norm_stats
+    ↓
+[standard_store.py] 预计算 xw_standard（加权特征矩阵）
     ↓
 [query.py] 单次查询：
   1. make_query_vector_15d() → 15维查询向量
-  2. flow_gate_keep_mask() → 候选子集索引
-  3. compute_and_normalize_candidates() → 动态归一化 + 相似度
-  4. Top-k 排序 → PlanResult
+  2. weighted_vector_1d() → 加权查询向量
+  3. cosine01() → 与 xw_standard 计算相似度
+  4. flow_gate_keep_mask() → 硬门控筛选
+  5. Top-k 排序 → PlanResult
     ↓
 [continuity.py] 连续性处理 → final_plan_center
     ↓
@@ -822,17 +825,17 @@ residual_models/（6个 .joblib）
 
 ## 常见问题
 
-### Q: 为什么训练阶段不计算归一化参数？
+### Q: 归一化参数如何生成和使用？
 
-A: 改为查询时动态计算候选子集的 median/IQR，使归一化更贴合当前候选集的分布，避免全局统计量对局部搜索的 bias。
+A: 训练阶段由 `train_residual.py` 计算所有 15 维相似度特征（9原始 + 6残差）的 median/IQR，保存为 `norm_stats.json`。查询时由 `standard_store.py` 加载，预计算加权特征矩阵 `xw_standard`，查询向量也用同一套参数归一化。
 
 ### Q: 候选集多大合适？
 
-A: 通常几百到一千条（负荷 ±15 t/h 范围内）。极端情况下可能只有几十条，此时回退全局统计。
+A: 通常几百到一千条（负荷 ±15 t/h 范围内）。极端情况下可能只有几十条。
 
-### Q: 如果候选集 < 5 条怎么办？
+### Q: 如果无候选通过门控怎么办？
 
-A: 自动回退全局统计量（如果存在 `norm_stats.json`）。如果也不存在，仍使用候选集统计量（可能不稳定）。
+A: 按最近负荷兜底，取最接近的 top_k 个样本。
 
 ### Q: 如何启用/禁用硬门控？
 

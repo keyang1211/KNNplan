@@ -158,7 +158,7 @@ def _query_one_detailed(
     """
     from plan_center.features import make_query_vector_15d
     from plan_center.config import build_feature_weights
-    from plan_center.similarity import candidate_similarity, compute_and_normalize_candidates, flow_gate_keep_mask
+    from plan_center.similarity import weighted_vector_1d, cosine01, flow_gate_keep_mask, pct_rank
 
     feat = cfg.features
     match_cfg = cfg.matching
@@ -167,8 +167,24 @@ def _query_one_detailed(
     # 1. 构建15维查询向量
     q_15d = make_query_vector_15d(raw_features, models, feat)
 
-    # 2. 硬门控先筛选候选
+    # 2. 加权归一化
     weights = build_feature_weights(feat)
+    q_xw, _ = weighted_vector_1d(q_15d, store.sim_feature_cols, store.norm_stats, weights)
+
+    # NaN保护：用0填充（中位数归一化后0=中位数水平）
+    if np.any(np.isnan(q_xw)):
+        q_xw = np.nan_to_num(q_xw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 3. 计算相似度（全库）
+    s_all = cosine01(q_xw.reshape(1, -1), store.xw_standard)[0]
+
+    # NaN检查：如有NaN，用均值填充
+    if np.any(np.isnan(s_all)):
+        nan_mask = np.isnan(s_all)
+        mean_val = np.nanmean(s_all)
+        s_all = np.where(nan_mask, mean_val, s_all)
+
+    # 4. 硬门控
     q_load = float(raw_features.get(feat.load_col, 0.0))
     keep_mask = flow_gate_keep_mask(q_load, store.loads_standard, gate_cfg)
     valid_pos = np.where(keep_mask)[0]
@@ -177,6 +193,8 @@ def _query_one_detailed(
         # 无样本通过硬门控，按最近负荷兜底
         if match_cfg.allow_fallback_nearest_load:
             valid_pos = np.argsort(np.abs(store.loads_standard - q_load))[:min(top_k, len(store.loads_standard))]
+            s_all = s_all.copy()
+            s_all[valid_pos] = 0.0
             match_status = "负荷硬门控未命中，按最近负荷兜底"
         else:
             return {
@@ -187,25 +205,13 @@ def _query_one_detailed(
     else:
         match_status = "正常匹配"
 
-    # 3. 对候选子集做动态归一化+相似度
-    df_candidates = store.df_standard.iloc[valid_pos]
-    weights = build_feature_weights(feat)
-    global_norm_stats = getattr(store, 'norm_stats', None)
-    s_candidates, effective_norm_stats, norm_source = compute_and_normalize_candidates(
-        df_candidates, q_15d, store.sim_feature_cols, weights, global_norm_stats
-    )
-    if np.any(np.isnan(s_candidates)):
-        nan_mask = np.isnan(s_candidates)
-        mean_val = np.nanmean(s_candidates)
-        s_candidates = np.where(nan_mask, mean_val, s_candidates)
+    # 5. D = a*S + b*E
+    d_all = match_cfg.d_weight_s * s_all + match_cfg.d_weight_e * store.eff_score_all
 
-    # 4. D = a*S + b*E
-    d_candidates = match_cfg.d_weight_s * s_candidates + match_cfg.d_weight_e * store.eff_score_all[valid_pos]
-
-    # 5. Top-K 排序
-    order = np.argsort(d_candidates)[::-1]
-    top_pos_local = order[:min(top_k, len(order))]
-    top_pos = valid_pos[top_pos_local]
+    # 6. Top-K 排序
+    d_valid = d_all[valid_pos]
+    order = np.argsort(d_valid)[::-1]
+    top_pos = valid_pos[order[:min(top_k, len(order))]]
 
     if len(top_pos) == 0:
         return {
@@ -214,11 +220,11 @@ def _query_one_detailed(
             "top5": [],
         }
 
-    # 6. 构建 Top-K 详情
+    # 7. 构建 Top-K 详情
     top_indices = top_pos.tolist()
-    top_s = s_candidates[top_pos_local]
-    top_d = d_candidates[top_pos_local]
-    top_e = store.eff_score_all[top_pos]
+    top_s = s_all[top_indices]
+    top_d = d_all[top_indices]
+    top_e = store.eff_score_all[top_indices]
     top_df = store.df_standard.iloc[top_indices]
 
     top5 = []

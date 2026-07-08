@@ -111,6 +111,7 @@ paths:
   # 实际数据路径
   stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
   residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
+  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数（所有相似度特征）
   query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
   cache_path: null    # null=不缓存
 
@@ -167,7 +168,7 @@ dtw_query:
   dtw_max_len: 6
 
   # 滑动步长（分钟）
-  slide_step: 1
+  slide_step: 3
 
   # Top-k
   top_k: 5
