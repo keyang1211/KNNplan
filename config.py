@@ -74,7 +74,7 @@ class FilterConfig:
 class PathsConfig:
     stable_parquet: str
     residual_model_dir: str
-    norm_stats_path: str | None = None
+    covariance_path: str | None = None
     query_parquet: str | None = None
     cache_path: str | None = None
 
@@ -275,7 +275,7 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
     paths = PathsConfig(
         stable_parquet=str(paths_raw.get("stable_parquet", "")),
         residual_model_dir=str(paths_raw.get("residual_model_dir", "")),
-        norm_stats_path=paths_raw.get("norm_stats_path", None),
+        covariance_path=paths_raw.get("covariance_path", None),
         query_parquet=paths_raw.get("query_parquet", None),
         cache_path=paths_raw.get("cache_path", None),
     )

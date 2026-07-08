@@ -225,3 +225,79 @@ def pct_rank(values: np.ndarray) -> np.ndarray:
 
     s = pd.Series(values)
     return s.rank(pct=True, method="average").values.astype(float)
+
+
+# =========================
+# 马氏距离（稳定工况查询用）
+# =========================
+
+def compute_covariance_matrix(
+    X: np.ndarray,
+    reg_lambda: float = 1e-6,
+) -> np.ndarray:
+    """
+    计算正则化协方差矩阵。
+
+    参数：
+        X: (N, D) 特征矩阵
+        reg_lambda: 正则化系数，防奇异
+
+    返回：
+        (D, D) 正则化协方差矩阵 Σ_reg = Σ + λ·mean(diag(Σ))·I
+    """
+    cov = np.cov(X, rowvar=False)
+    if cov.ndim == 0:  # 单特征退化
+        cov = cov.reshape(1, 1)
+    reg = reg_lambda * np.mean(np.diag(cov)) * np.eye(cov.shape[0])
+    return cov + reg
+
+
+def weighted_cov_inv_matrix(
+    cov: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """
+    构造加权协方差逆矩阵 M = W^{1/2} · Σ⁻¹ · W^{1/2}。
+
+    数学等价于加权协方差矩阵 Σ_W = W^{-1/2}·Σ·W^{-1/2} 的逆矩阵。
+    权重大的特征在 M 中对应位置被放大，使该特征差异对距离贡献增大。
+    权重=0 的特征对应行列为0，不参与距离。
+
+    参数：
+        cov: (D, D) 正则化协方差矩阵
+        weights: (D,) 归一化权重向量（和为1）
+
+    返回：
+        (D, D) 加权协方差逆矩阵 M
+    """
+    inv_cov = np.linalg.pinv(cov)   # 伪逆，数值稳定
+    w_sqrt = np.sqrt(np.maximum(weights, 0.0))
+    W_sqrt = np.diag(w_sqrt)
+    M = W_sqrt @ inv_cov @ W_sqrt
+    return M
+
+
+def mahalanobis_similarity(
+    q: np.ndarray,
+    X: np.ndarray,
+    M: np.ndarray,
+) -> np.ndarray:
+    """
+    批量计算马氏距离相似度 S = 1/(1+d²)（柯西核）。
+
+    参数：
+        q: (D,) 查询向量（原始特征，未归一化）
+        X: (N, D) 标准样本矩阵（原始特征）
+        M: (D, D) 加权协方差逆矩阵
+
+    返回：
+        (N,) 相似度数组 ∈ (0, 1]，1表示完全相同
+    """
+    q = np.asarray(q, dtype=float)
+    X = np.asarray(X, dtype=float)
+    q = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    diff = X - q  # (N, D)
+    d_sq = np.einsum('ij,jk,ik->i', diff, M, diff)  # (N,) 二次型
+    d_sq = np.maximum(d_sq, 0.0)  # 数值保护，避免负数
+    return (1.0 / (1.0 + d_sq)).astype(np.float32)

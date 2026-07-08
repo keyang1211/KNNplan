@@ -70,7 +70,7 @@ features:
 
 matching:
   # D = a*S + b*E（无频次分F）
-  # S = 加权余弦相似度（所有特征均做 robust 归一化）
+  # S = 马氏距离相似度（柯西核 S=1/(1+d²)，加权协方差矩阵）
   # E = 效率分位数（0~1）
   d_weight_s: 1.0    # a（相似度权重）
   d_weight_e: 0.0    # b（效率权重）
@@ -111,7 +111,7 @@ paths:
   # 实际数据路径
   stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
   residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
-  norm_stats_path: "D:/redian/vectorsearch/plan_center/output/norm_stats.json"       # 归一化参数（所有相似度特征）
+  covariance_path: "D:/redian/vectorsearch/plan_center/output/covariance.json"       # 加权协方差逆矩阵（马氏距离用）
   query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
   cache_path: null    # null=不缓存
 

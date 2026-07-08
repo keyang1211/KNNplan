@@ -10,10 +10,11 @@ train_residual.py — 残差特征训练模块
 3. 分层抽样（可开关）
 4. 训练残差模型（HistGradientBoostingRegressor）
 5. 5-fold OOF 生成残差
-6. 计算归一化参数（median/IQR）
-7. 保存输出（向量数据库、模型、归一化参数、报告）
+6. 计算加权协方差逆矩阵（马氏距离用）
+7. 保存输出（向量数据库、模型、协方差矩阵、报告）
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,8 @@ from sklearn.base import clone
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-from .config import PlanningConfig, load_config
+from .config import PlanningConfig, load_config, build_feature_weights
+from .similarity import compute_covariance_matrix, weighted_cov_inv_matrix, weight_array
 
 
 # =========================
@@ -103,6 +105,39 @@ def _exclude_last_month(
 
     print(f"最后一个月排除: 参考数据截止时间 {max_time}，剔除 >= {cutoff} 的样本")
     print(f"  {before} → {after}，排除 {before - after} 行（{ (before - after) / max(before, 1) * 100:.2f}%）")
+
+
+def filter_by_cutoff_date(
+    df: pd.DataFrame,
+    cutoff_date: str,
+    date_col: str = "日期",
+) -> pd.DataFrame:
+    """
+    按截止日期过滤稳定工况数据，只保留 < cutoff_date 的样本。
+
+    参数：
+        df: 稳定工况 DataFrame
+        cutoff_date: 截止日期字符串（如 '2025-05-11'），保留此日期之前的样本
+        date_col: 日期列名
+
+    返回：
+        过滤后的 DataFrame
+    """
+    if date_col not in df.columns:
+        print(f"警告: 稳定工况数据中未找到日期列 '{date_col}'，跳过截止日期过滤")
+        return df
+
+    cutoff = pd.Timestamp(cutoff_date)
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+
+    before = len(df)
+    df = df[df[date_col] < cutoff].reset_index(drop=True)
+    after = len(df)
+
+    print(f"截止日期过滤: 只保留 < {cutoff_date} 的样本")
+    print(f"  {before} → {after}，排除 {before - after} 行（{ (before - after) / max(before, 1) * 100:.2f}%）")
+    return df
 
 
 # =========================
@@ -452,31 +487,46 @@ def train_residual_models(
 
 
 # =========================
-# 归一化参数计算
+# 加权协方差逆矩阵计算
 # =========================
 
-def compute_norm_stats(
+def compute_and_save_covariance(
     df: pd.DataFrame,
-    feature_cols: list[str],
-) -> dict:
+    sim_feature_cols: list[str],
+    weights_dict: dict[str, float],
+    output_path: Path,
+    reg_lambda: float = 1e-6,
+) -> np.ndarray:
     """
-    计算分位数归一化参数（median/IQR）。
+    计算加权协方差逆矩阵 M = W^{1/2}·Σ⁻¹·W^{1/2} 并保存到 JSON。
 
-    返回:
-        {col: {"median": float, "iqr": float, "mean": float, "std": float}}
+    参数：
+        df: 含 sim_feature_cols 列的 DataFrame
+        sim_feature_cols: 相似度特征列名（raw + residual）
+        weights_dict: 特征权重字典
+        output_path: 输出 JSON 路径
+        reg_lambda: 协方差矩阵正则化系数
+
+    返回：
+        (D, D) 加权协方差逆矩阵 M
     """
-    stats = {}
-    for c in feature_cols:
-        s = df[c].astype(float)
-        q25, q75 = s.quantile(0.25), s.quantile(0.75)
-        iqr = q75 - q25
-        stats[c] = {
-            "median": float(s.median()),
-            "iqr": float(iqr if abs(iqr) > 1e-12 else 1.0),
-            "mean": float(s.mean()),
-            "std": float(s.std(ddof=0)),
-        }
-    return stats
+    X = df[sim_feature_cols].values.astype(np.float64)
+    cov = compute_covariance_matrix(X, reg_lambda=reg_lambda)
+    w = weight_array(sim_feature_cols, weights_dict)
+    M = weighted_cov_inv_matrix(cov, w)
+
+    cov_data = {
+        "cov_inv_matrix": M.tolist(),
+        "feature_cols": sim_feature_cols,
+        "reg_lambda": reg_lambda,
+    }
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(cov_data, f, ensure_ascii=False, indent=2)
+
+    print(f"已保存协方差逆矩阵: {output_path}，形状 {M.shape}")
+    return M
 
 
 # =========================
@@ -486,7 +536,6 @@ def compute_norm_stats(
 def save_outputs(
     df_vector_db: pd.DataFrame,
     models: dict,
-    norm_stats: dict,
     model_report: pd.DataFrame,
     residual_report: pd.DataFrame,
     output_dir: str,
@@ -495,9 +544,10 @@ def save_outputs(
     保存输出：
     - vector_db.parquet
     - residual_model_*.joblib（6个）
-    - norm_stats.json（归一化参数）
     - residual_report.csv
     - model_report.csv
+
+    注意：协方差逆矩阵由 compute_and_save_covariance 独立保存。
 
     返回输出路径字典。
     """
@@ -521,14 +571,7 @@ def save_outputs(
     paths["model_dir"] = str(model_dir)
     print(f"已保存残差模型: {model_dir}")
 
-    # 3. 归一化参数
-    norm_stats_path = output_dir / "norm_stats.json"
-    with open(norm_stats_path, "w", encoding="utf-8") as f:
-        json.dump(norm_stats, f, ensure_ascii=False, indent=2)
-    paths["norm_stats"] = str(norm_stats_path)
-    print(f"已保存归一化参数: {norm_stats_path}")
-
-    # 4. 训练报告
+    # 3. 训练报告
     model_report_path = output_dir / "model_report.csv"
     model_report.to_csv(model_report_path, index=False, encoding="utf-8-sig")
     paths["model_report"] = str(model_report_path)
@@ -547,6 +590,13 @@ def save_outputs(
 
 def main():
     """主流程：读取 → 筛选 → 训练 → 计算残差 → 归一化 → 保存。"""
+    parser = argparse.ArgumentParser(description="残差特征训练：生成向量数据库 + 协方差矩阵")
+    parser.add_argument(
+        "--cutoff-date", type=str, default=None,
+        help="截止日期（如 '2025-05-11'），只保留此日期之前的稳定工况样本。不传则不过滤",
+    )
+    args = parser.parse_args()
+
     print("=== 残差特征训练 ===\n")
 
     # 加载配置
@@ -566,6 +616,15 @@ def main():
         last_month_exclusion_parquet=cfg.paths.query_parquet,
         date_col=cfg.features.date_col if hasattr(cfg.features, "date_col") else "日期",
     )
+
+    # 1.5 截止日期过滤（可选）
+    if args.cutoff_date:
+        print("\n[1.5] 截止日期过滤...")
+        df = filter_by_cutoff_date(
+            df,
+            cutoff_date=args.cutoff_date,
+            date_col=cfg.features.date_col if hasattr(cfg.features, "date_col") else "日期",
+        )
 
     # 2. 合理工况筛选
     if train_cfg.enable_filter:
@@ -618,14 +677,18 @@ def main():
     print("\n模型训练报告:")
     print(model_report[["target", "train_R2", "valid_R2", "test_R2", "oof_R2"]])
 
-    # 5. 计算归一化参数（对所有相似度特征：原始特征 + 残差特征）
-    print("\n[5] 计算归一化参数...")
+    # 5. 计算加权协方差逆矩阵（对所有相似度特征：原始特征 + 残差特征）
+    print("\n[5] 计算加权协方差逆矩阵...")
     residual_feat_cols = [f"resid_{t}" for t in cfg.features.residual_targets]
     all_sim_feature_cols = cfg.features.raw_features + residual_feat_cols
     # 只计算数据中实际存在的特征
     all_sim_feature_cols = [c for c in all_sim_feature_cols if c in df.columns]
-    norm_stats = compute_norm_stats(df, all_sim_feature_cols)
-    print(f"归一化特征数: {len(norm_stats)}（原始特征 + 残差特征）")
+    weights = build_feature_weights(cfg.features)
+    covariance_path = Path(train_cfg.output_dir) / "covariance.json"
+    compute_and_save_covariance(
+        df, all_sim_feature_cols, weights, covariance_path
+    )
+    print(f"相似度特征数: {len(all_sim_feature_cols)}（原始特征 + 残差特征）")
 
     # 6. 构建向量数据库
     print("\n[6] 构建向量数据库...")
@@ -646,7 +709,6 @@ def main():
     paths = save_outputs(
         df_vector_db,
         models,
-        norm_stats,
         model_report,
         residual_report,
         train_cfg.output_dir,
@@ -655,7 +717,7 @@ def main():
     print("\n=== 训练完成 ===")
     print(f"向量数据库: {paths['vector_db']}")
     print(f"残差模型: {paths['model_dir']}")
-    print(f"归一化参数: {paths['norm_stats']}")
+    print(f"协方差逆矩阵: {covariance_path}")
 
 
 if __name__ == "__main__":

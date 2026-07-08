@@ -8,11 +8,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import PlanningConfig, build_feature_weights
+from .config import PlanningConfig
 from .continuity import apply_output_continuity, has_valid_center, should_reset_continuity
 from .features import make_query_vector_15d
 from .schemas import PlanResult
-from .similarity import cosine01, flow_gate_keep_mask, weighted_vector_1d
+from .similarity import mahalanobis_similarity, flow_gate_keep_mask
 from .standard_store import StandardStore
 
 
@@ -51,22 +51,14 @@ def query_one(
         result.match_status = f"查询特征异常: {e}"
         return result
 
-    # 2. 加权（用 store 的 norm_stats）
-    weights = build_feature_weights(feat)
+    # 2. 马氏距离相似度（用预计算的加权协方差逆矩阵 M）
     try:
-        q_xw, _ = weighted_vector_1d(q_15d, store.sim_feature_cols, store.norm_stats, weights)
+        s_all = mahalanobis_similarity(q_15d, store.X_standard, store.cov_inv_matrix)
     except Exception as e:
-        result.match_status = f"加权失败: {e}"
+        result.match_status = f"相似度计算失败: {e}"
         return result
 
-    # NaN 保护：将 NaN/Inf 替换为 0
-    q_xw = np.nan_to_num(q_xw, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # 3. 余弦相似度
-    q_xw_2d = q_xw.reshape(1, -1)
-    s_all = cosine01(q_xw_2d, store.xw_standard)[0]
-
-    # 4. 硬门控
+    # 3. 硬门控
     raw_dict = raw_features if isinstance(raw_features, dict) else dict(raw_features)
     q_load = float(raw_dict.get(feat.load_col, 0.0))
     keep_mask = flow_gate_keep_mask(q_load, store.loads_standard, gate_cfg)
@@ -84,10 +76,10 @@ def query_one(
     else:
         result.match_status = "正常匹配"
 
-    # 5. D = a*S + b*E（无 F）
+    # 4. D = a*S + b*E（无 F）
     d_all = match_cfg.d_weight_s * s_all + match_cfg.d_weight_e * store.eff_score_all
 
-    # 6. Top-k by D
+    # 5. Top-k by D
     d_valid = d_all[valid_pos]
     order = np.argsort(d_valid)[::-1]
     top_pos = valid_pos[order[:min(match_cfg.top_k, len(order))]]
@@ -108,7 +100,7 @@ def query_one(
         store.df_standard.iloc[top_pos][feat.eff_col].astype(float).mean()
     )
 
-    # 7. 低相似度回退判定
+    # 6. 低相似度回退判定
     if match_cfg.enable_low_sim_fallback:
         result.low_sim_fallback = bool(
             result.similarity_topk_mean < match_cfg.low_sim_fallback_threshold

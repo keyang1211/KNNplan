@@ -92,16 +92,12 @@ def main():
 
     # 重新计算完整 S 和 D（取 Top-K）
     from plan_center.features import make_query_vector_15d
-    from plan_center.config import build_feature_weights
-    from plan_center.similarity import weighted_vector_1d, cosine01
+    from plan_center.similarity import mahalanobis_similarity, flow_gate_keep_mask
 
     q_15d = make_query_vector_15d(raw_features, engine.models, engine.cfg.features)
-    weights = build_feature_weights(engine.cfg.features)
-    q_xw, _ = weighted_vector_1d(q_15d, engine.store.sim_feature_cols, engine.store.norm_stats, weights)
-    s_all = cosine01(q_xw.reshape(1, -1), engine.store.xw_standard)[0]
+    s_all = mahalanobis_similarity(q_15d, engine.store.X_standard, engine.store.cov_inv_matrix)
 
     # 硬门控
-    from plan_center.similarity import flow_gate_keep_mask
     q_load = float(raw_features.get(engine.cfg.features.load_col, 0.0))
     keep_mask = flow_gate_keep_mask(q_load, engine.store.loads_standard, engine.cfg.flow_gate)
     valid_pos = np.where(keep_mask)[0]

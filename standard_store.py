@@ -3,7 +3,7 @@
 standard_store.py — 标准样本 V（向量数据库）的加载与管理
 
 简化版：向量数据库 parquet 已经是完全处理好的，包含原始特征 + resid_* 列 + 锅炉效率列。
-本模块只负责：读 parquet → 加载归一化参数 → 构建加权矩阵 → 计算效率分位数 E → 缓存
+本模块只负责：读 parquet → 加载协方差逆矩阵 → 构建原始特征矩阵 → 计算效率分位数 E → 缓存
 """
 
 from __future__ import annotations
@@ -19,7 +19,12 @@ import numpy as np
 import pandas as pd
 
 from .config import PlanningConfig, build_feature_weights
-from .similarity import robust_norm_stats, weighted_matrix, pct_rank
+from .similarity import (
+    compute_covariance_matrix,
+    weighted_cov_inv_matrix,
+    weight_array,
+    pct_rank,
+)
 
 
 # =========================
@@ -31,9 +36,9 @@ class StandardStore:
     """加载并预处理后的标准样本 V。"""
 
     df_standard: pd.DataFrame          # N 行标准样本（已含 resid_* 和锅炉效率列）
-    xw_standard: np.ndarray            # (N, D) 加权特征矩阵
+    X_standard: np.ndarray             # (N, D) 原始特征矩阵（未归一化，马氏距离用）
     loads_standard: np.ndarray         # (N,) 主汽流量
-    norm_stats: dict                   # 归一化统计量 {col: {median, iqr, ...}}
+    cov_inv_matrix: np.ndarray         # (D, D) 加权协方差逆矩阵 M
     sim_feature_cols: list[str]        # D 个相似度特征列名（raw + residual）
     eff_score_all: np.ndarray          # (N,) 效率分位数 E
 
@@ -91,9 +96,9 @@ def build_cache_signature(cfg: PlanningConfig) -> dict:
         "eff_col": cfg.features.eff_col,
         "load_col": cfg.features.load_col,
     }
-    # 归一化参数路径也纳入签名
-    if cfg.paths.norm_stats_path:
-        sig["norm_stats_path"] = str(cfg.paths.norm_stats_path)
+    # 协方差矩阵路径也纳入签名
+    if cfg.paths.covariance_path:
+        sig["covariance_path"] = str(cfg.paths.covariance_path)
     return sig
 
 
@@ -136,13 +141,13 @@ def save_cache(store: StandardStore, cfg: PlanningConfig) -> None:
 
 def build_standard_store(cfg: PlanningConfig) -> StandardStore:
     """
-    读取向量数据库 parquet，加载归一化参数，构建标准样本 V。
+    读取向量数据库 parquet，加载协方差逆矩阵，构建标准样本 V。
 
     步骤:
     1. 尝试加载缓存
     2. 读 parquet
-    3. 加载归一化参数（从 norm_stats.json）
-    4. 构建加权特征矩阵
+    3. 加载加权协方差逆矩阵 M（从 covariance.json）
+    4. 构建原始特征矩阵 X_standard
     5. 计算效率分位数 E
     6. 保存缓存
     """
@@ -186,21 +191,26 @@ def build_standard_store(cfg: PlanningConfig) -> StandardStore:
     df = df.dropna(subset=required_cols).reset_index(drop=True)
     print(f"标准样本数量: {len(df)}")
 
-    # 4. 归一化统计量（优先从文件加载）
-    if cfg.paths.norm_stats_path and Path(cfg.paths.norm_stats_path).exists():
-        with open(cfg.paths.norm_stats_path, "r", encoding="utf-8") as f:
-            norm_stats = json.load(f)
-        print(f"从文件加载归一化参数: {cfg.paths.norm_stats_path}")
-    else:
-        # 兼容旧逻辑：如果没有保存的归一化参数，则自己计算
-        norm_stats = robust_norm_stats(df, sim_feature_cols)
-        print("未找到归一化参数文件，使用数据计算")
-
-    # 5. 加权特征矩阵（含 NaN 保护）
+    # 4. 加权协方差逆矩阵 M（优先从文件加载）
     weights = build_feature_weights(feat)
-    xw_standard, _ = weighted_matrix(df, sim_feature_cols, norm_stats, weights)
-    # NaN 保护：将加权矩阵中的 NaN/Inf 替换为 0，避免后续 cosine_similarity 报错
-    xw_standard = np.nan_to_num(xw_standard, nan=0.0, posinf=0.0, neginf=0.0)
+    if cfg.paths.covariance_path and Path(cfg.paths.covariance_path).exists():
+        with open(cfg.paths.covariance_path, "r", encoding="utf-8") as f:
+            cov_data = json.load(f)
+        cov_inv_matrix = np.array(cov_data["cov_inv_matrix"], dtype=np.float64)
+        print(f"从文件加载协方差逆矩阵: {cfg.paths.covariance_path}")
+    else:
+        # 兜底：未找到文件则现场计算（标准样本库不变，结果一致）
+        X_temp = df[sim_feature_cols].values.astype(np.float64)
+        cov = compute_covariance_matrix(X_temp)
+        w = weight_array(sim_feature_cols, weights)
+        cov_inv_matrix = weighted_cov_inv_matrix(cov, w)
+        print("未找到协方差矩阵文件，使用数据现场计算")
+
+    # 5. 原始特征矩阵（未归一化，马氏距离用）
+    X_standard = np.nan_to_num(
+        df[sim_feature_cols].values.astype(np.float32),
+        nan=0.0, posinf=0.0, neginf=0.0,
+    )
 
     # 6. 效率分位数 E
     eff_score_all = pct_rank(df[feat.eff_col].values.astype(float))
@@ -209,9 +219,9 @@ def build_standard_store(cfg: PlanningConfig) -> StandardStore:
 
     store = StandardStore(
         df_standard=df,
-        xw_standard=xw_standard.astype(np.float32),
+        X_standard=X_standard,
         loads_standard=loads_standard.astype(np.float32),
-        norm_stats=norm_stats,
+        cov_inv_matrix=cov_inv_matrix,
         sim_feature_cols=sim_feature_cols,
         eff_score_all=eff_score_all.astype(np.float32),
     )
