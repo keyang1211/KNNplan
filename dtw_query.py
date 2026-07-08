@@ -270,6 +270,8 @@ def query_dtw(
     time_col: str | None = None,
     alias_map: dict[str, str] | None = None,
     verbose: bool = True,
+    dtw_align_func=None,
+    cosine_mean_func=None,
 ) -> PlanResult:
     """
     DTW 时序查询主函数。
@@ -296,9 +298,16 @@ def query_dtw(
     返回：
         PlanResult
     """
+    # ---- 0. 选择 DTW 对齐函数 ----
+    if dtw_align_func is None:
+        dtw_align_func = dtw_align_with_coverage
+    if cosine_mean_func is None:
+        cosine_mean_func = dtw_weighted_cosine_mean
+
     if verbose:
         print(f"\n[DTW] ===== DTW 查询 =====")
         print(f"[DTW] 查询时间戳: {query_ts}")
+        print(f"[DTW] 使用函数: {dtw_align_func.__module__}.{dtw_align_func.__name__}")
 
     # ---- 1. 解析时间戳，定位行号 ----
     time_col = _resolve_time_col("", time_col, ref_df_resid)
@@ -357,6 +366,16 @@ def query_dtw(
 
     query_matrix = query_df[sim_feature_cols].values.astype(float)  # (T_q, D)
 
+    # ---- 4.5 填充 NaN 值 ----
+    # 某些列（如 吨煤产气量）可能有 NaN，用该列均值填充
+    for i, col in enumerate(sim_feature_cols):
+        if np.isnan(query_matrix[:, i]).any():
+            col_mean = ref_window[col].mean()
+            if pd.notna(col_mean):
+                query_matrix[np.isnan(query_matrix[:, i]), i] = col_mean
+                if verbose:
+                    print(f"[DTW] 填充 NaN: {col} -> 均值 {col_mean:.4f}")
+
     # ---- 5. 构建候选矩阵（固定 dtw_max_len 分钟，滑动步长 1 分钟）----
     # 候选序列滑动范围: [ref_window 开头, ref_window 末尾 - dtw_max_len)
     # 固定用 dtw_max_len 长度切分，不再 4/5/6 三种
@@ -370,6 +389,12 @@ def query_dtw(
     for start in range(cand_pool_start, cand_pool_end - cand_length + 1, dtw_cfg.slide_step):
         end = start + cand_length
         mat = ref_window[sim_feature_cols].iloc[start:end].values.astype(float)
+        # 填充 NaN
+        for i in range(mat.shape[1]):
+            if np.isnan(mat[:, i]).any():
+                col_mean = ref_window[sim_feature_cols[i]].mean()
+                if pd.notna(col_mean):
+                    mat[np.isnan(mat[:, i]), i] = col_mean
         # 映射回全局索引
         global_start = int((ref_df_resid[time_col] <= t_start).sum()) + start
         candidates.append({
@@ -388,18 +413,34 @@ def query_dtw(
     if verbose:
         print(f"[DTW] DTW 对齐 + 覆盖帧检查 + 加权 cosine 计算中 ...")
 
+    # 构建特征权重数组
+    feat_weights = np.ones(len(sim_feature_cols), dtype=np.float64)
+
     sim_scores: list[float] = []
     coverage_ok_list: list[bool] = []
     for cand in candidates:
-        aligned_pairs, path_cost, coverage_ok = dtw_align_with_coverage(
-            query_matrix, cand["matrix"],
-            min_coverage=dtw_cfg.dtw_min_len   # 默认 4
-        )
+        # JIT 版本和 Python 版本签名兼容处理
+        # Python: (query, cand, feature_weights=None, min_coverage=4)
+        # JIT:    (query, cand, feature_weights, min_coverage)
+        if 'jit' in dtw_align_func.__name__.lower():
+            # JIT 版本：位置参数传递
+            aligned_pairs, path_cost, coverage_ok = dtw_align_func(
+                query_matrix, cand["matrix"],
+                feat_weights,
+                dtw_cfg.dtw_min_len
+            )
+        else:
+            # Python 版本：关键字参数传递
+            aligned_pairs, path_cost, coverage_ok = dtw_align_func(
+                query_matrix, cand["matrix"],
+                feature_weights=feat_weights,
+                min_coverage=dtw_cfg.dtw_min_len
+            )
         # 覆盖帧不足的候选相似度置 0（不参与 Top-k）
         if not coverage_ok:
             sim_scores.append(0.0)
         else:
-            sim = dtw_weighted_cosine_mean(query_matrix, cand["matrix"], aligned_pairs)
+            sim = cosine_mean_func(query_matrix, cand["matrix"], aligned_pairs)
             sim_scores.append(sim)
         cand["dtw_cost"] = path_cost
         cand["path_length"] = len(aligned_pairs)
@@ -593,3 +634,64 @@ class DTWQueryEngine:
             alias_map=self.cfg.features.column_aliases,
             verbose=verbose,
         )
+
+    def query_one_fast(self, query_ts: str | pd.Timestamp, verbose: bool = True) -> PlanResult:
+        """
+        Fast 模式 DTW 查询（使用 Numba JIT 加速）。
+
+        参数：
+            query_ts: 查询时间戳
+            verbose: 是否打印进度
+
+        返回：
+            PlanResult
+        """
+        self._ensure_data_loaded()
+
+        if self.ref_df_resid is None or self.models is None:
+            raise RuntimeError("DTWQueryEngine 数据未正确加载")
+
+        # 导入 JIT 函数
+        from .dtw_fast import dtw_align_with_coverage_jit, dtw_weighted_cosine_mean_jit
+
+        return query_dtw(
+            query_ts=query_ts,
+            ref_df_resid=self.ref_df_resid,
+            feat=self.cfg.features,
+            dtw_cfg=self.cfg.dtw_query,
+            norm_stats=self.norm_stats,
+            time_col=self.cfg.time_col,
+            alias_map=self.cfg.features.column_aliases,
+            verbose=verbose,
+            dtw_align_func=dtw_align_with_coverage_jit,
+            cosine_mean_func=dtw_weighted_cosine_mean_jit,
+        )
+
+    def warmup(self, n_iter: int = 3) -> None:
+        """
+        预热 JIT 编译，避免首次调用开销。
+
+        参数：
+            n_iter: 预热迭代次数
+        """
+        self._ensure_data_loaded()
+
+        if self.ref_df_resid is None:
+            return
+
+        from .dtw_fast import dtw_align_jit, dtw_weighted_cosine_mean_jit, warmup_jit
+
+        feat = self.cfg.features
+        dtw_cfg = self.cfg.dtw_query
+
+        # 构建样例数据
+        all_feature_cols = feat.raw_features + [f"resid_{t}" for t in feat.residual_targets]
+        sim_feature_cols = list(dict.fromkeys(all_feature_cols))
+
+        sample_df = self.ref_df_resid.iloc[:10]
+        sample_matrix = sample_df[sim_feature_cols].values[:5].astype(np.float64)
+        weights = np.ones(sample_matrix.shape[1])
+
+        print(f"[DTW] 预热 JIT 编译（{n_iter} 次）...")
+        warmup_jit(sample_matrix, sample_matrix, weights, n_iter)
+        print("[DTW] 预热完成")

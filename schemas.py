@@ -96,6 +96,11 @@ def plan_result_to_row(result: PlanResult, plan_center_cols: list[str]) -> dict:
     row["Top1时间差_天"] = getattr(result, '_top1_time_diff', np.nan)
     row["Top5平均时间差_天"] = getattr(result, '_top5_mean_time_diff', np.nan)
 
+    # DTW 特有诊断字段（动态附加属性）
+    row["dtw_path_cost"] = getattr(result, '_dtw_path_cost', np.nan)
+    row["dtw_n_candidates"] = getattr(result, '_n_candidates', 0)
+    row["dtw_time_offset_days"] = getattr(result, '_time_offset_days', np.nan)
+
     return row
 
 
