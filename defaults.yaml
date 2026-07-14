@@ -111,8 +111,9 @@ paths:
   # 实际数据路径
   stable_parquet: "D:/redian/vectorsearch/plan_center/output/vector_db.parquet"        # 向量数据库（训练输出）
   residual_model_dir: "D:/redian/vectorsearch/plan_center/output/residual_models"    # 残差模型目录
-  covariance_path: "D:/redian/vectorsearch/plan_center/output/covariance.json"       # 加权协方差逆矩阵（马氏距离用）
+  covariance_path: "D:/redian/vectorsearch/plan_center/output/covariance.json"       # 加权协方差逆矩阵（马氏距离用，稳定工况路径）
   query_parquet: "D:/redian/vectorsearch/#4_df_all_1min.parquet"                     # 分钟级查询数据
+  dtw_norm_stats_path: "D:/redian/vectorsearch/plan_center/output/dtw_norm_stats.json"  # DTW cos 标准化参数（mean/std，全量数据预计算）
   cache_path: null    # null=不缓存
 
 train:
@@ -156,6 +157,11 @@ time_col: null    # null=自动识别时间列
 # =============================================
 # DTW 时序查询配置
 # =============================================
+# 相似度度量：加权 cos 相似度
+#   - 标准化：z-score（全量数据预计算 mean/std，保存到 paths.dtw_norm_stats_path）
+#   - 加权：特征乘 √w（权重0的特征自动排除，与马氏距离 M 矩阵行为一致）
+#   - DTW 对齐代价 = 1 - cos（cos 越大越相似，代价越小越好）
+#   - 对齐后相似度 = (cos+1)/2 均值，映射到 [0,1]
 dtw_query:
   # 参考窗口：当前时刻往前 N 天
   ref_days: 3
@@ -168,7 +174,7 @@ dtw_query:
   dtw_max_len: 6
 
   # 滑动步长（分钟）
-  slide_step: 3
+  slide_step: 1
 
   # Top-k
   top_k: 5
@@ -176,7 +182,8 @@ dtw_query:
   # 残差缓存路径
   resid_cache_parquet: "D:/redian/vectorsearch/#4_df_all_1min_with_resid.parquet"
 
-  # DTW 距离权重（各特征在 DTW 欧氏距离中的权重，默认与 similarity weights 一致）
+  # dtw_feature_weights：DTW cos 加权权重（√w 乘特征，权重0的特征自动排除）
+  # 与 features.weights 一致，此处保留用于 DTW 路径独立配置
   dtw_feature_weights:
     主汽流量: 0.0
     吨煤产气量: 0.0
@@ -188,6 +195,20 @@ dtw_query:
     锅炉出口氧量: 0.42
     二次风风量: 0.30
     热值: 0.0
+
+  # 预筛配置：DTW 前两级预筛，减少候选数量
+  # 1. 负荷初筛：查询序列平均主汽流量 ± load_threshold，筛选参考窗口内连续片段
+  # 2. cos 预筛：等长滑窗（query_seq_len）+ z-score 标准化（全量统计量）+ 加权（√w）+ 逐点 cos，低于阈值的删掉
+  # 3. DTW 阶段：在 cos 通过的窗口起点上生成 6 分钟候选，做加权 cos DTW 对齐
+  prefilter:
+    enable: true
+    load_threshold: 15.0      # 负荷初筛阈值（t/h），与 flow_gate.abs_threshold 一致
+    cos_threshold: 0.5        # cos 相似度阈值，低于此值的窗口删掉
+    cos_slide_step: 1         # cos 预筛滑窗步长（分钟）
+
+  # 并行计算配置
+  # 单次查询内部 DTW 并行线程数（Numba JIT 释放 GIL，可真正并行）
+  n_workers: 4
 
 # =============================================
 # 权重寻优配置（数值梯度下降）

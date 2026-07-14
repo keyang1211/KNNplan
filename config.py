@@ -77,6 +77,7 @@ class PathsConfig:
     covariance_path: str | None = None
     query_parquet: str | None = None
     cache_path: str | None = None
+    dtw_norm_stats_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,15 @@ class OptimizeV2Config:
 
 
 @dataclass(frozen=True)
+class DTWPrefilterConfig:
+    """DTW 预筛配置（负荷初筛 + cos 相似度筛选）。"""
+    enable: bool = True              # 是否启用预筛
+    load_threshold: float = 15.0     # 负荷初筛阈值（t/h）
+    cos_threshold: float = 0.8       # cos 相似度筛选阈值
+    cos_slide_step: int = 1          # cos 预筛滑窗步长（分钟）
+
+
+@dataclass(frozen=True)
 class DTWQueryConfig:
     """DTW 时序查询配置。"""
     ref_days: int              # 参考窗口天数
@@ -166,6 +176,8 @@ class DTWQueryConfig:
     top_k: int                 # Top-k
     resid_cache_parquet: str   # 残差缓存 parquet 路径
     dtw_feature_weights: dict[str, float]  # DTW 距离权重（欧氏距离中各特征权重）
+    prefilter: DTWPrefilterConfig = field(default_factory=DTWPrefilterConfig)
+    n_workers: int = 4             # 单次查询内部 DTW 并行线程数（Numba JIT 释放 GIL）
 
 
 @dataclass(frozen=True)
@@ -278,6 +290,7 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         covariance_path=paths_raw.get("covariance_path", None),
         query_parquet=paths_raw.get("query_parquet", None),
         cache_path=paths_raw.get("cache_path", None),
+        dtw_norm_stats_path=paths_raw.get("dtw_norm_stats_path", None),
     )
 
     # 解析 train 配置（可选）
@@ -381,6 +394,13 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
             top_k=int(dtw_raw.get("top_k", 5)),
             resid_cache_parquet=str(dtw_raw.get("resid_cache_parquet", "")),
             dtw_feature_weights={k: float(v) for k, v in dtw_raw.get("dtw_feature_weights", {}).items()},
+            prefilter=DTWPrefilterConfig(
+                enable=bool(dtw_raw.get("prefilter", {}).get("enable", True)),
+                load_threshold=float(dtw_raw.get("prefilter", {}).get("load_threshold", 15.0)),
+                cos_threshold=float(dtw_raw.get("prefilter", {}).get("cos_threshold", 0.8)),
+                cos_slide_step=int(dtw_raw.get("prefilter", {}).get("cos_slide_step", 1)),
+            ),
+            n_workers=int(dtw_raw.get("n_workers", 4)),
         )
 
     return PlanningConfig(

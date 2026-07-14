@@ -142,17 +142,19 @@ def _extract_dtw_diagnostics(plan_center: dict, actual: dict, result: Any) -> di
 # 逐点 DTW 查询
 # =========================
 
-def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True, use_fast=False):
+def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True,
+                       query_start_mask=None):
     """
     逐点调用 DTW 查询引擎，收集结果和诊断信息。
 
     参数：
         engine: DTWQueryEngine
-        df: 查询数据 DataFrame
+        df: 查询数据 DataFrame（可能含前 ref_days 天的参考数据）
         time_col: 时间列名
         sample_step: 采样步长（分钟）
         verbose: 是否打印进度
-        use_fast: 是否使用 Numba JIT 加速模式
+        query_start_mask: bool 数组，标记哪些行需要查询/绘图（None=全部）。
+            用于 DTW 场景：df 含前 ref_days 天参考数据，但只对 mask=True 的行查询。
 
     返回：
         (results, df_out) -> (List[PlanResult], pd.DataFrame)
@@ -161,25 +163,25 @@ def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True, use_fa
 
     plan_center_cols = list(engine.cfg.features.plan_center_cols)
 
-    # 采样
-    indices = range(0, len(df), sample_step)
-    total = len(list(indices))
+    # 采样：若提供 query_start_mask，只对 mask=True 的行采样
+    if query_start_mask is not None:
+        query_start_mask = np.asarray(query_start_mask)
+        all_indices = np.where(query_start_mask)[0]
+        indices = all_indices[::sample_step]
+    else:
+        indices = np.arange(0, len(df), sample_step)
+    indices = list(indices)
+    total = len(indices)
 
     results = []
     t0 = time.perf_counter()
-
-    # 选择查询方法
-    query_method = "query_one_fast" if use_fast else "query_one"
 
     for i, row_idx in enumerate(indices):
         row = df.iloc[row_idx]
         query_ts = row[time_col]
 
         try:
-            if use_fast:
-                result = engine.query_one_fast(query_ts, verbose=False)
-            else:
-                result = engine.query_one(query_ts, verbose=False)
+            result = engine.query_one(query_ts, verbose=False)
             results.append(result)
         except Exception as e:
             if verbose and i == 0:
@@ -196,11 +198,11 @@ def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True, use_fa
             print(f"  进度: {i+1}/{total}，均速 {avg:.1f}s/点，剩余 {eta:.0f}s")
 
     elapsed_total = time.perf_counter() - t0
-    print(f"\nDTW 查询完成: {len(results)}/{total} 条，总耗时 {elapsed_total:.1f}s，均速 {elapsed_total/len(results):.1f}s/点")
+    print(f"\nDTW 查询完成: {len(results)}/{total} 条，总耗时 {elapsed_total:.1f}s，均速 {elapsed_total/max(len(results),1):.1f}s/点")
 
-    # 构建输出 DataFrame
+    # 构建输出 DataFrame（仅查询的行）
     df_out = build_output_dataframe(
-        raw_df=df.iloc[list(indices)].reset_index(drop=True),
+        raw_df=df.iloc[indices].reset_index(drop=True),
         results=results,
         plan_center_cols=plan_center_cols,
     )
@@ -561,14 +563,12 @@ def main():
                         help="输出 HTML 路径（默认按时间范围自动命名）")
     parser.add_argument("--config", type=str, default=None,
                         help="配置文件路径（默认 defaults.yaml）")
-    parser.add_argument("--fast", action="store_true",
-                        help="使用 Numba JIT 加速模式（需预热）")
     args = parser.parse_args()
 
     use_specified_range = bool(args.start and args.end)
 
     print("=== DTW 验证脚本：连续数据可视化 ===\n")
-    print(f"模式: {'Fast (JIT)' if args.fast else 'Baseline (Python)'}\n")
+    print("模式: Python (ThreadPool 并行)\n")
 
     # 1. 加载配置 + 初始化 DTW 引擎
     print("[1] 加载 DTWQueryEngine...")
@@ -606,7 +606,7 @@ def main():
     dtw_cfg = cfg.dtw_query
     if use_specified_range:
         print(f"\n[3] 按指定时间范围选取: {args.start} ~ {args.end}")
-        # 为了让可视化范围起点也能正确匹配，需往前扩展 ref_days 天
+        # 为了让可视化范围起点也能正确匹配，需往前扩展 ref_days 天作为 DTW 参考窗口
         t_user_start = pd.Timestamp(args.start)
         t_actual_start = t_user_start - pd.Timedelta(days=dtw_cfg.ref_days)
         # 从扩展起点选取到用户指定的结束时间（含边界）
@@ -618,6 +618,10 @@ def main():
         print(f"    DTW 参考窗口扩展: {t_actual_start} ~ {t_end}")
         print(f"    实际选取: {df_selected[time_col].min()} ~ {df_selected[time_col].max()} ({len(df_selected)} 行)")
         print(f"    可视化范围: {args.start} ~ {args.end}")
+        # 查询/绘图只针对用户指定范围（t_user_start ~ t_end），前 ref_days 天仅作参考窗口
+        query_start_mask = df_selected[time_col] >= t_user_start
+        n_ref = int((~query_start_mask).sum())
+        print(f"    参考（不查询）前 {n_ref} 行（{t_actual_start} ~ {t_user_start}）")
         start_label = pd.Timestamp(args.start).strftime("%Y-%m-%d")
         end_label = pd.Timestamp(args.end).strftime("%Y-%m-%d")
         range_str = f"{start_label}_to_{end_label}"
@@ -636,21 +640,21 @@ def main():
             df_selected = df_query[mask].sort_values(time_col).reset_index(drop=True)
             print(f"    DTW 参考窗口扩展: {t_actual_start} ~ {df_selected[time_col].max()}")
             print(f"    实际选取: {df_selected[time_col].min()} ~ {df_selected[time_col].max()} ({len(df_selected)} 行)")
+        # 随机模式：查询/绘图只针对原始随机选取范围（t_min ~），前 ref_days 天仅作参考窗口
+        t_user_start = t_min
+        query_start_mask = df_selected[time_col] >= t_user_start
+        n_ref = int((~query_start_mask).sum())
+        print(f"    参考（不查询）前 {n_ref} 行（{t_actual_start} ~ {t_user_start}）")
         t_start = df_selected[time_col].min()
         t_end = df_selected[time_col].max()
         range_str = f"{t_start.strftime('%Y-%m-%d')}_{args.days}days"
-        title = f"DTW 验证：实际值 vs 规划值（随机{args.days}天，{t_start.strftime('%Y-%m-%d %H:%M')} ~ {t_end.strftime('%Y-%m-%d %H:%M')}）"
+        title = f"DTW 验证：实际值 vs 规划值（随机{args.days}天，{t_user_start.strftime('%Y-%m-%d %H:%M')} ~ {t_end.strftime('%Y-%m-%d %H:%M')}）"
 
-    # 4. 预热（如果使用 Fast 模式）
-    if args.fast:
-        print("\n[3.5] JIT 预热中...")
-        engine.warmup(n_iter=3)
-        print("[3.5] 预热完成\n")
-
-    # 4. 逐点 DTW 查询
-    print(f"\n[4] 逐点 DTW 查询（sample_step={args.sample_step}）...")
+    # 4. 逐点 DTW 查询（仅查询/绘图 t_user_start 之后的数据，前 ref_days 天仅作参考窗口）
+    print(f"\n[4] 逐点 DTW 查询（sample_step={args.sample_step}，查询范围 {t_user_start} ~ {t_end}）...")
     results, df_out = run_validation_dtw(engine, df_selected, time_col,
-                                          sample_step=args.sample_step, use_fast=args.fast)
+                                          sample_step=args.sample_step,
+                                          query_start_mask=query_start_mask)
 
     if len(df_out) == 0:
         print("\n警告: 选取的数据为空，跳过可视化")
