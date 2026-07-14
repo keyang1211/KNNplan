@@ -161,7 +161,8 @@ time_col: null    # null=自动识别时间列
 #   - 对齐后相似度 = 柯西核 S=1/(1+d²) 均值，映射到 (0,1]
 #   - 协方差逆矩阵 M 复用 paths.covariance_path（与稳定工况路径共用）
 dtw_query:
-  # 参考窗口：当前时刻往前 N 天
+  # 参考窗口天数：调用方按此值截取最近 N 天数据传入引擎
+  # 引擎本身不截取窗口，直接用传入 df 的前 (len - query_seq_len) 行作为参考
   ref_days: 3
 
   # 查询序列长度（分钟）
@@ -177,7 +178,7 @@ dtw_query:
   # Top-k
   top_k: 5
 
-  # 残差缓存路径
+  # 残差缓存路径（ensure_resid_cache 工具函数用，调用方可选用）
   resid_cache_parquet: "D:/redian/vectorsearch/#4_df_all_1min_with_resid.parquet"
 
   # dtw_feature_weights：DTW 马氏距离加权权重（M = W^(1/2) Σ⁻¹ W^(1/2) 嵌入权重，权重0的特征自动排除）

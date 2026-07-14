@@ -18,7 +18,10 @@ dtw_query.py — DTW 时序查询核心
 用法：
     from plan_center.dtw_query import DTWQueryEngine, query_dtw
     engine = DTWQueryEngine(cfg)
-    result = engine.query_one(timestamp="2024-11-01 08:00:00")
+    # 调用方负责准备最近 ref_days 天的数据（含残差特征）
+    # ref_df 末尾 query_seq_len 行是查询序列，前面部分是参考窗口
+    ref_df = ...  # pd.DataFrame
+    result = engine.query_one(ref_df)
 """
 
 from __future__ import annotations
@@ -476,11 +479,11 @@ def _parallel_dtw_align(
 
 
 def query_dtw(
-    query_ts: str | pd.Timestamp,
-    ref_df_resid: pd.DataFrame,
+    ref_df: pd.DataFrame,
     feat: Any,
     dtw_cfg: DTWQueryConfig,
-    cov_inv_matrix: np.ndarray | None = None,
+    cov_inv_matrix: np.ndarray,
+    query_ts: str | pd.Timestamp | None = None,
     time_col: str | None = None,
     alias_map: dict[str, str] | None = None,
     verbose: bool = True,
@@ -489,21 +492,23 @@ def query_dtw(
     """
     DTW 时序查询主函数（加权马氏距离 + 柯西核）。
 
+    调用方负责准备 ref_df：最近 N 天数据（含残差特征），末尾 query_seq_len 行是查询序列。
+    引擎不截取时间窗口，直接用 ref_df 前面部分作为参考窗口，末尾作为查询序列。
+
     流程：
-        1. 解析查询时间戳，定位 ref_df 中的行号
-        2. 截取参考窗口（t - ref_days天 ~ t）
-        3. 接收加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
-        4. 提取查询序列（ref_window 末尾 query_seq_len 个点）和候选序列（dtw_max_len min 滑窗）
+        1. 解析 time_col，拆分 ref_df → ref_window（前面）+ query_df（末尾 query_seq_len 行）
+        2. 接收加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
+        3. 负荷初筛 + 马氏距离预筛
+        4. 构建候选矩阵（dtw_max_len min 滑窗）
         5. DTW 对齐（马氏距离代价）+ 柯西核相似度均值 → 序列相似度
-        6. Top-k 排序
-        7. 生成规划中心
+        6. Top-k 排序 + 生成规划中心
 
     参数：
-        query_ts: 查询时间戳（字符串或 pd.Timestamp）
-        ref_df_resid: 带残差特征的参考 DataFrame（分钟级，时间有序）
+        ref_df: 完整窗口数据（参考+查询序列），末尾 query_seq_len 行是查询序列
         feat: FeatureConfig
         dtw_cfg: DTWQueryConfig
         cov_inv_matrix: (D, D) 加权协方差逆矩阵 M（从 covariance.json 加载）
+        query_ts: 查询时间戳（可选，仅用于诊断；None 时用 ref_df 末尾时间）
         time_col: 时间列名（None=自动识别）
         alias_map: 列名别名映射
         verbose: 是否打印进度
@@ -512,42 +517,37 @@ def query_dtw(
     返回：
         PlanResult
     """
+    # ---- 1. 解析 time_col，拆分 ref_df ----
+    time_col = _resolve_time_col("", time_col, ref_df)
+
+    # 避免 SettingWithCopyWarning
+    ref_df = ref_df.copy()
+    ref_df[time_col] = pd.to_datetime(ref_df[time_col], errors="coerce")
+
+    ref_n_total = len(ref_df)
+    q_len = dtw_cfg.query_seq_len
+
+    if ref_n_total < q_len + dtw_cfg.dtw_max_len:
+        raise ValueError(
+            f"ref_df 行数 ({ref_n_total}) 不足以支撑查询序列 ({q_len}) + 最小候选长度 ({dtw_cfg.dtw_max_len})"
+        )
+
+    # 查询序列 = ref_df 末尾 query_seq_len 行；参考窗口 = 前面部分
+    ref_window = ref_df.iloc[:-q_len].copy().reset_index(drop=True)
+    query_df = ref_df.iloc[-q_len:].copy().reset_index(drop=True)
+    ref_n = len(ref_window)
+
+    # query_ts 处理：None 时用 ref_df 末尾时间
+    if query_ts is None:
+        query_ts = ref_df[time_col].iloc[-1]
+    else:
+        query_ts = pd.to_datetime(query_ts)
+
     if verbose:
         print(f"\n[DTW] ===== DTW 查询 =====")
         print(f"[DTW] 查询时间戳: {query_ts}")
-
-    # ---- 1. 解析时间戳，定位行号 ----
-    time_col = _resolve_time_col("", time_col, ref_df_resid)
-
-    # 避免 SettingWithCopyWarning：用 .copy() 确保独立
-    ref_df_resid = ref_df_resid.copy()
-    ref_df_resid[time_col] = pd.to_datetime(ref_df_resid[time_col], errors="coerce")
-    query_ts = pd.to_datetime(query_ts)
-
-    # 找到 query_ts 对应的行号
-    time_mask = ref_df_resid[time_col] <= query_ts
-    if time_mask.sum() == 0:
-        raise ValueError(f"查询时间戳 {query_ts} 早于参考数据最早时间 {ref_df_resid[time_col].min()}")
-
-    query_row_idx = int(time_mask.values.nonzero()[0][-1])
-    if verbose:
-        print(f"[DTW] 查询行索引: {query_row_idx}，时间: {ref_df_resid[time_col].iloc[query_row_idx]}")
-
-    # ---- 2. 截取参考窗口 ----
-    t_start = query_ts - pd.Timedelta(days=dtw_cfg.ref_days)
-    ref_mask = (ref_df_resid[time_col] > t_start) & (ref_df_resid[time_col] <= query_ts)
-    ref_window = ref_df_resid[ref_mask].copy().reset_index(drop=True)
-    ref_n = len(ref_window)
-
-    if verbose:
-        print(f"[DTW] 参考窗口: {ref_window[time_col].min()} ~ {ref_window[time_col].max()}")
-        print(f"[DTW] 参考窗口行数: {ref_n}")
-
-    if ref_n < dtw_cfg.dtw_max_len + dtw_cfg.query_seq_len:
-        raise ValueError(
-            f"参考窗口行数 ({ref_n}) 不足以支撑最小候选序列长度 "
-            f"({dtw_cfg.dtw_max_len}) + 查询序列 ({dtw_cfg.query_seq_len})"
-        )
+        print(f"[DTW] ref_df 行数: {ref_n_total}（参考窗口 {ref_n} + 查询序列 {q_len}）")
+        print(f"[DTW] 参考窗口范围: {ref_window[time_col].min()} ~ {ref_window[time_col].max()}")
 
     # ---- 3. 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）----
     all_feature_cols = feat.raw_features + [f"resid_{t}" for t in feat.residual_targets]
@@ -561,16 +561,8 @@ def query_dtw(
     if verbose:
         print(f"[DTW] 特征数: {len(sim_feature_cols)}，M 矩阵 shape: {M.shape}")
 
-    # ---- 4. 提取查询序列（ref_window 末尾 query_seq_len 个点）----
-    # 查询序列 = ref_window 末尾 query_seq_len 个点（不含 query_ts，已由 <= 条件排除）
-    q_start = max(0, ref_n - dtw_cfg.query_seq_len)
-    q_end = ref_n
-    query_df = ref_window.iloc[q_start:q_end].copy()
-    if len(query_df) < dtw_cfg.query_seq_len:
-        pad_needed = dtw_cfg.query_seq_len - len(query_df)
-        pad_df = ref_window.iloc[:pad_needed].copy()
-        query_df = pd.concat([pad_df, query_df], ignore_index=True)
-
+    # ---- 4. 提取查询序列特征矩阵 ----
+    # query_df 已在 Step 1 从 ref_df 末尾拆分（query_seq_len 行）
     query_matrix = query_df[sim_feature_cols].values.astype(float)  # (T_q, D)
 
     # ---- 4.5 填充 NaN 值（用 0.0 填充，马氏距离用）----
@@ -626,28 +618,25 @@ def query_dtw(
     candidates: list[dict] = []
     cand_length = dtw_cfg.dtw_max_len  # 固定用最大长度，DTW 弹性对齐代替多长度
 
-    # 查询序列位于 ref_window 末尾 query_seq_len 个点（行索引 [ref_n - query_seq_len, ref_n)）
-    # 候选窗口不得与查询序列重叠：要求 end <= ref_n - query_seq_len
-    query_region_start = ref_n - dtw_cfg.query_seq_len
+    # 查询序列已从 ref_window 拆分出去，候选窗口可在整个 ref_window 内滑动
+    # 候选窗口 end 必须 <= ref_n（不进入查询序列区域）
+    query_region_start = ref_n
 
     # 预计算整个 ref_window 的原始特征矩阵（一次性，候选直接切片复用）
     ref_features = ref_window[sim_feature_cols].values.astype(float)  # (ref_n, D)
     ref_features = np.nan_to_num(ref_features, nan=0.0)
 
-    # 候选窗口起点偏移量（ref_df_resid 中 t_start 之前的行数）
-    global_offset = int((ref_df_resid[time_col] <= t_start).sum())
-
+    # orig_start_idx / orig_end_idx 直接用 ref_df 的局部行号（ref_window 是 ref_df 的前 ref_n 行，索引一致）
     for start in passed_starts:
         end = start + cand_length
         if end > query_region_start:
-            continue  # 排除与查询序列重叠的候选
+            continue  # 排除越界候选
 
         # 直接从预计算的原始特征矩阵切片（O(1)）
         mat = ref_features[start:end]  # (cand_length, D)
-        global_start = global_offset + start
         candidates.append({
-            "orig_start_idx": global_start,
-            "orig_end_idx": global_start + cand_length,
+            "orig_start_idx": start,
+            "orig_end_idx": end,
             "length": cand_length,
             "matrix": mat,
         })
@@ -712,8 +701,8 @@ def query_dtw(
         for idx in top_indices:
             cand = candidates[idx]
             end_idx = cand["orig_end_idx"]
-            if end_idx <= len(ref_df_resid) and col_name in ref_df_resid.columns:
-                vals.append(float(ref_df_resid[col_name].iloc[end_idx - 1]))
+            if end_idx <= len(ref_df) and col_name in ref_df.columns:
+                vals.append(float(ref_df[col_name].iloc[end_idx - 1]))
 
         if vals:
             raw_plan_center[c] = float(np.average(vals, weights=d_weights))
@@ -731,11 +720,11 @@ def query_dtw(
 
     # 时间偏移（最佳候选末帧时间 - 查询时间，单位：天）
     time_offset_days = np.nan
-    if best_cand and time_col in ref_df_resid.columns:
+    if best_cand and time_col in ref_df.columns:
         try:
             cand_end_idx = best_cand["orig_end_idx"]
-            if cand_end_idx <= len(ref_df_resid):
-                cand_end_time = pd.to_datetime(ref_df_resid[time_col].iloc[cand_end_idx - 1])
+            if cand_end_idx <= len(ref_df):
+                cand_end_time = pd.to_datetime(ref_df[time_col].iloc[cand_end_idx - 1])
                 time_offset_days = abs((cand_end_time - query_ts).total_seconds()) / 86400.0
         except Exception:
             time_offset_days = np.nan
@@ -790,47 +779,32 @@ class DTWQueryEngine:
 
     持有：
         - cfg: PlanningConfig（含 DTWQueryConfig）
-        - ref_df_resid: 带残差特征的分钟级参考 DataFrame
-        - models: 残差模型字典
         - cov_inv_matrix: (D, D) 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
+        - models: 残差模型字典（供 ensure_resid_cache 工具函数用，query_one 不依赖）
+
+    调用方负责准备 ref_df（最近 N 天数据，含残差特征），通过 query_one(ref_df) 传入。
+    引擎不持有全量数据，不截取时间窗口。
     """
 
     cfg: PlanningConfig
-    ref_df_resid: pd.DataFrame | None = None
-    models: dict[str, object] | None = None
     cov_inv_matrix: np.ndarray | None = None
+    models: dict[str, object] | None = None
     n_workers: int = 4
     _cache_loaded: bool = field(default=False, init=False, repr=False)
 
     # ---- 初始化 / 加载 ----
 
     def _ensure_data_loaded(self) -> None:
-        """懒加载：首次调用时加载参考数据 + 残差模型 + 标准化参数。"""
+        """懒加载：首次调用时加载加权协方差逆矩阵 M。"""
         if self._cache_loaded:
             return
 
         if self.cfg.dtw_query is None:
             raise RuntimeError("PlanningConfig 中缺少 dtw_query 配置段")
 
-        dtw_cfg = self.cfg.dtw_query
-        feat = self.cfg.features
         paths = self.cfg.paths
 
-        # 1. 残差缓存
-        cache_path = ensure_resid_cache(
-            raw_parquet=paths.query_parquet,
-            model_dir=paths.residual_model_dir,
-            feat=feat,
-            cache_parquet=dtw_cfg.resid_cache_parquet,
-            feature_cols=feat.raw_features,
-            alias_map=feat.column_aliases,
-        )
-        self.ref_df_resid = pd.read_parquet(cache_path)
-
-        # 2. 加载残差模型
-        self.models = load_residual_models(paths.residual_model_dir, feat.residual_targets)
-
-        # 3. 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
+        # 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
         if paths.covariance_path and Path(paths.covariance_path).exists():
             import json
             with open(paths.covariance_path, "r", encoding="utf-8") as f:
@@ -844,12 +818,18 @@ class DTWQueryEngine:
 
         self._cache_loaded = True
 
-    def query_one(self, query_ts: str | pd.Timestamp, verbose: bool = True) -> PlanResult:
+    def query_one(
+        self,
+        ref_df: pd.DataFrame,
+        query_ts: str | pd.Timestamp | None = None,
+        verbose: bool = True,
+    ) -> PlanResult:
         """
         单次 DTW 查询（加权马氏距离 + 柯西核）。
 
         参数：
-            query_ts: 查询时间戳
+            ref_df: 完整窗口数据（参考+查询序列），末尾 query_seq_len 行是查询序列
+            query_ts: 查询时间戳（可选，仅用于诊断；None 时用 ref_df 末尾时间）
             verbose: 是否打印进度
 
         返回：
@@ -857,15 +837,15 @@ class DTWQueryEngine:
         """
         self._ensure_data_loaded()
 
-        if self.ref_df_resid is None or self.models is None:
+        if self.cov_inv_matrix is None:
             raise RuntimeError("DTWQueryEngine 数据未正确加载")
 
         return query_dtw(
-            query_ts=query_ts,
-            ref_df_resid=self.ref_df_resid,
+            ref_df=ref_df,
             feat=self.cfg.features,
             dtw_cfg=self.cfg.dtw_query,
             cov_inv_matrix=self.cov_inv_matrix,
+            query_ts=query_ts,
             time_col=self.cfg.time_col,
             alias_map=self.cfg.features.column_aliases,
             verbose=verbose,

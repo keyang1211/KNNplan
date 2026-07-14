@@ -142,19 +142,20 @@ def _extract_dtw_diagnostics(plan_center: dict, actual: dict, result: Any) -> di
 # 逐点 DTW 查询
 # =========================
 
-def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True,
+def run_validation_dtw(engine, df_all, time_col, ref_days, sample_step=1, verbose=True,
                        query_start_mask=None):
     """
-    逐点调用 DTW 查询引擎，收集结果和诊断信息。
+    逐点调用 DTW 查询引擎，每个查询点从 df_all 截取 [t-ref_days, t] 窗口传入。
 
     参数：
         engine: DTWQueryEngine
-        df: 查询数据 DataFrame（可能含前 ref_days 天的参考数据）
+        df_all: 全量分钟级数据（含残差，时间有序）
         time_col: 时间列名
+        ref_days: 参考窗口天数（cfg.dtw_query.ref_days）
         sample_step: 采样步长（分钟）
         verbose: 是否打印进度
-        query_start_mask: bool 数组，标记哪些行需要查询/绘图（None=全部）。
-            用于 DTW 场景：df 含前 ref_days 天参考数据，但只对 mask=True 的行查询。
+        query_start_mask: bool 数组，标记哪些行需要查询（None=全部）。
+            用于 DTW 场景：df_all 含前 ref_days 天参考数据，但只对 mask=True 的行查询。
 
     返回：
         (results, df_out) -> (List[PlanResult], pd.DataFrame)
@@ -169,19 +170,26 @@ def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True,
         all_indices = np.where(query_start_mask)[0]
         indices = all_indices[::sample_step]
     else:
-        indices = np.arange(0, len(df), sample_step)
+        indices = np.arange(0, len(df_all), sample_step)
     indices = list(indices)
     total = len(indices)
+
+    # 预取时间数组用于窗口截取
+    times = df_all[time_col].values
 
     results = []
     t0 = time.perf_counter()
 
     for i, row_idx in enumerate(indices):
-        row = df.iloc[row_idx]
-        query_ts = row[time_col]
+        query_ts = df_all[time_col].iloc[row_idx]
+
+        # 截取 [t-ref_days, t] 窗口作为 ref_df 传入引擎
+        t_start = query_ts - pd.Timedelta(days=ref_days)
+        mask = (times >= t_start) & (times <= query_ts)
+        ref_df_window = df_all[mask].reset_index(drop=True)
 
         try:
-            result = engine.query_one(query_ts, verbose=False)
+            result = engine.query_one(ref_df_window, query_ts=query_ts, verbose=False)
             results.append(result)
         except Exception as e:
             if verbose and i == 0:
@@ -202,7 +210,7 @@ def run_validation_dtw(engine, df, time_col, sample_step=1, verbose=True,
 
     # 构建输出 DataFrame（仅查询的行）
     df_out = build_output_dataframe(
-        raw_df=df.iloc[indices].reset_index(drop=True),
+        raw_df=df_all.iloc[indices].reset_index(drop=True),
         results=results,
         plan_center_cols=plan_center_cols,
     )
@@ -580,22 +588,23 @@ def main():
     print(f"    DTW 配置: ref_days={cfg.dtw_query.ref_days}, query_seq_len={cfg.dtw_query.query_seq_len}, "
           f"dtw_min_len={cfg.dtw_query.dtw_min_len}, top_k={cfg.dtw_query.top_k}")
 
-    # 2. 读取分钟级查询 parquet
+    # 2. 读取分钟级查询数据（含残差特征）
     print("\n[2] 读取分钟级查询数据...")
-    query_parquet = cfg.paths.query_parquet
-    if not query_parquet or not Path(query_parquet).exists():
-        raise FileNotFoundError(f"查询数据路径不存在: {query_parquet}")
+    from plan_center.dtw_query import ensure_resid_cache
 
-    df_query = pd.read_parquet(query_parquet)
+    dtw_cfg = cfg.dtw_query
+    feat = cfg.features
 
-    # 应用列别名映射
-    aliases = cfg.features.column_aliases
-    if aliases:
-        for old, new in aliases.items():
-            if old in df_query.columns and new not in df_query.columns:
-                df_query[new] = df_query[old]
-            elif old in df_query.columns and new in df_query.columns:
-                df_query = df_query.drop(columns=[old])
+    # 确保残差缓存存在（首次调用时从原始 parquet 生成，含残差特征）
+    resid_cache_path = ensure_resid_cache(
+        raw_parquet=cfg.paths.query_parquet,
+        model_dir=cfg.paths.residual_model_dir,
+        feat=feat,
+        cache_parquet=dtw_cfg.resid_cache_parquet,
+        feature_cols=feat.raw_features,
+        alias_map=feat.column_aliases,
+    )
+    df_query = pd.read_parquet(resid_cache_path)
 
     time_col = cfg.time_col or "时间"
     df_query[time_col] = pd.to_datetime(df_query[time_col], errors="coerce")
@@ -603,7 +612,6 @@ def main():
     print(f"    查询数据: {df_query.shape}，时间范围 {df_query[time_col].min()} ~ {df_query[time_col].max()}")
 
     # 3. 选取数据（扩展开头以确保 DTW 有足够参考窗口）
-    dtw_cfg = cfg.dtw_query
     if use_specified_range:
         print(f"\n[3] 按指定时间范围选取: {args.start} ~ {args.end}")
         # 为了让可视化范围起点也能正确匹配，需往前扩展 ref_days 天作为 DTW 参考窗口
@@ -653,6 +661,7 @@ def main():
     # 4. 逐点 DTW 查询（仅查询/绘图 t_user_start 之后的数据，前 ref_days 天仅作参考窗口）
     print(f"\n[4] 逐点 DTW 查询（sample_step={args.sample_step}，查询范围 {t_user_start} ~ {t_end}）...")
     results, df_out = run_validation_dtw(engine, df_selected, time_col,
+                                          ref_days=dtw_cfg.ref_days,
                                           sample_step=args.sample_step,
                                           query_start_mask=query_start_mask)
 
