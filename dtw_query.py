@@ -3,11 +3,12 @@
 dtw_query.py — DTW 时序查询核心
 
 新增独立查询路径，不修改现有 PlanningEngine / query.py。
-相似度度量：加权 cos 相似度
-    - 标准化：z-score（全量数据预计算 mean/std，保存到 paths.dtw_norm_stats_path）
-    - 加权：特征乘 √w（权重0的特征自动排除）
-    - DTW 对齐代价 = 1 - cos（cos 越大越相似，代价越小越好）
-    - 对齐后相似度 = (cos+1)/2 均值，映射到 [0,1]
+相似度度量：加权马氏距离 + 柯西核（与稳定工况查询路径一致）
+    - 标准化：通过加权协方差逆矩阵 M 隐式标准化
+    - 加权：M = W^(1/2) Σ⁻¹ W^(1/2)（权重0的特征自动排除）
+    - DTW 对齐代价 = 马氏距离 d=sqrt((q-x)ᵀM(q-x))
+    - 对齐后相似度 = 柯西核 S=1/(1+d²) 均值，映射到 (0,1]
+    - 协方差逆矩阵 M 复用 paths.covariance_path（与稳定工况路径共用）
 依赖：
     - plan_center.features（add_residual_features / load_residual_models）
     - plan_center.config（DTWQueryConfig / PlanningConfig / build_feature_weights）
@@ -32,7 +33,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics.pairwise import cosine_similarity
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -43,36 +43,46 @@ from .batch import _resolve_time_col
 
 
 # ============================================================
-# 工具：DTW 对齐（加权 cos 相似度代价，numpy 手动实现）
+# 工具：DTW 对齐（加权马氏距离代价，numpy 手动实现）
 # ============================================================
 
 
-def dtw_align_cos(
+def dtw_align_mahalanobis(
     query_seq: np.ndarray,
     cand_seq: np.ndarray,
+    M: np.ndarray,
     sakoe_chiba_w: int = 0,
 ) -> tuple[list[tuple[int, int]], float, np.ndarray]:
     """
-    标准 DTW 动态规划对齐（cos 距离代价），支持 Sakoe-Chiba 带约束。
+    标准 DTW 动态规划对齐（马氏距离代价），支持 Sakoe-Chiba 带约束。
 
-    输入序列需预先做 z-score 标准化 + √w 加权。
+    输入序列为原始特征（不做 z-score，不做 √w 加权），标准化和加权通过 M 矩阵隐式完成。
 
     参数：
-        query_seq: (T_q, D) 查询序列（已标准化+加权）
-        cand_seq: (T_c, D) 候选序列（已标准化+加权）
+        query_seq: (T_q, D) 查询序列（原始特征）
+        cand_seq: (T_c, D) 候选序列（原始特征）
+        M: (D, D) 加权协方差逆矩阵
         sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束全矩阵，>=1 限制 |i-j|<=w）
 
     返回：
-        (aligned_pairs, path_cost, cos_matrix)
+        (aligned_pairs, path_cost, dist_matrix)
         aligned_pairs: [(i_q, i_c), ...]，正序
         path_cost: 最小累积代价（DTW 距离）
-        cos_matrix: (T_q, T_c) 逐点 cos 相似度矩阵，供 dtw_cos_mean 复用
+        dist_matrix: (T_q, T_c) 逐点马氏距离矩阵，供 dtw_mahalanobis_mean 复用
     """
     n, m = query_seq.shape[0], cand_seq.shape[0]
 
-    # 预计算逐点 cos 距离矩阵 (n, m)，cos_dist = 1 - cos
-    cos_matrix = cosine_similarity(query_seq, cand_seq)  # (n, m) ∈ [-1, 1]
-    dist_matrix = 1.0 - cos_matrix  # [0, 2]
+    # 预计算逐点马氏距离矩阵 (n, m)
+    # d²[i,j] = (q[i]-x[j])ᵀ M (q[i]-x[j])
+    # 向量化展开：d² = qMq - 2 qMx + xMx
+    Mq = M @ query_seq.T                              # (D, n)
+    Mx = M @ cand_seq.T                               # (D, m)
+    qMq = np.sum(query_seq.T * Mq, axis=0)            # (n,)  qᵀMq
+    xMx = np.sum(cand_seq.T * Mx, axis=0)             # (m,)  xᵀMx
+    qMx = query_seq @ Mx                              # (n, m) qᵀMx
+    d_sq = qMq[:, None] - 2.0 * qMx + xMx[None, :]    # (n, m)
+    d_sq = np.maximum(d_sq, 0.0)                       # 数值保护
+    dist_matrix = np.sqrt(d_sq)                        # (n, m) 马氏距离 d
 
     # DP 成本矩阵
     D = np.full((n, m), np.inf, dtype=float)
@@ -129,65 +139,68 @@ def dtw_align_cos(
         aligned_pairs.append((i, j))
 
     aligned_pairs.reverse()
-    return aligned_pairs, float(D[-1, -1]), cos_matrix
+    return aligned_pairs, float(D[-1, -1]), dist_matrix
 
 
-def dtw_align_with_coverage_cos(
+def dtw_align_with_coverage_mahalanobis(
     query_seq: np.ndarray,
     cand_seq: np.ndarray,
+    M: np.ndarray,
     min_coverage: int = 4,
     sakoe_chiba_w: int = 0,
 ) -> tuple[list[tuple[int, int]], float, bool, np.ndarray]:
     """
-    DTW 对齐 + 候选覆盖帧检查（cos 距离代价）。
+    DTW 对齐 + 候选覆盖帧检查（马氏距离代价）。
 
-    比 dtw_align_cos() 多返回一个 bool: 路径中涉及的不重复候选帧数 >= min_coverage。
+    比 dtw_align_mahalanobis() 多返回一个 bool: 路径中涉及的不重复候选帧数 >= min_coverage。
 
     参数：
-        query_seq: (T_q, D) 查询序列（已标准化+加权）
-        cand_seq: (T_c, D) 候选序列（已标准化+加权）
+        query_seq: (T_q, D) 查询序列（原始特征）
+        cand_seq: (T_c, D) 候选序列（原始特征）
+        M: (D, D) 加权协方差逆矩阵
         min_coverage: 最少不重复候选帧数（默认 4）
         sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束，>=1 限制 |i-j|<=w）
 
     返回：
-        (aligned_pairs, path_cost, coverage_ok, cos_matrix)
+        (aligned_pairs, path_cost, coverage_ok, dist_matrix)
     """
-    aligned_pairs, path_cost, cos_matrix = dtw_align_cos(query_seq, cand_seq, sakoe_chiba_w=sakoe_chiba_w)
+    aligned_pairs, path_cost, dist_matrix = dtw_align_mahalanobis(
+        query_seq, cand_seq, M=M, sakoe_chiba_w=sakoe_chiba_w
+    )
     # 计算路径覆盖的不重复候选帧数
     cand_indices = np.array([j for _, j in aligned_pairs])
     n_unique = int(np.unique(cand_indices).size)
     coverage_ok = n_unique >= min_coverage
-    return aligned_pairs, path_cost, coverage_ok, cos_matrix
+    return aligned_pairs, path_cost, coverage_ok, dist_matrix
 
 
 # ============================================================
-# 工具：DTW 对齐后 cos 相似度均值（映射到 [0,1]）
+# 工具：DTW 对齐后马氏距离相似度均值（柯西核，映射到 (0,1]）
 # ============================================================
 
 
-def dtw_cos_mean(
-    cos_matrix: np.ndarray,
+def dtw_mahalanobis_mean(
+    dist_matrix: np.ndarray,
     aligned_pairs: list[tuple[int, int]],
 ) -> float:
     """
-    对齐后从 cos_matrix 直接取值，映射 (cos+1)/2 到 [0,1]，取均值。
+    对齐后从 dist_matrix 直接取值，柯西核 S=1/(1+d²) 映射到 (0,1]，取均值。
 
     参数：
-        cos_matrix: (T_q, T_c) 逐点 cos 相似度矩阵（由 dtw_align_cos 预计算）
+        dist_matrix: (T_q, T_c) 逐点马氏距离矩阵（由 dtw_align_mahalanobis 预计算）
         aligned_pairs: DTW 对齐索引对 [(i_q, i_c), ...]
 
     返回：
-        float，均值相似度 [0, 1]
+        float，均值相似度 (0, 1]
     """
     if not aligned_pairs:
         return 0.0
 
-    # 直接从 cos_matrix 取对齐点对的 cos 值
-    cos_vals = np.array([cos_matrix[i, j] for i, j in aligned_pairs])
-    cos_vals = np.clip(cos_vals, -1.0, 1.0)
+    # 直接从 dist_matrix 取对齐点对的马氏距离
+    d_vals = np.array([dist_matrix[i, j] for i, j in aligned_pairs])
 
-    # 映射到 [0, 1] 后取均值
-    sims = (cos_vals + 1.0) / 2.0
+    # 柯西核映射到 (0, 1] 后取均值
+    sims = 1.0 / (1.0 + d_vals ** 2)
     return float(np.mean(sims))
 
 
@@ -264,7 +277,7 @@ def ensure_resid_cache(
 
 
 # ============================================================
-# 预筛辅助函数：负荷初筛 + cos 相似度预筛
+# 预筛辅助函数：负荷初筛 + 马氏距离预筛
 # ============================================================
 
 
@@ -308,47 +321,42 @@ def load_filter_segments(
     return segments
 
 
-def cos_prefilter(
-    query_matrix: np.ndarray,       # (T_q, D) 查询序列（已标准化+加权）
+def mahalanobis_prefilter(
+    query_matrix: np.ndarray,       # (T_q, D) 查询序列（原始特征）
     ref_window: pd.DataFrame,        # 参考窗口
     segments: list[tuple[int, int]], # 负荷初筛通过的片段
-    sim_feature_cols: list[str],     # 15维特征列名
-    cos_threshold: float,            # cos 相似度阈值
-    cos_slide_step: int,             # 滑窗步长
-    col_mean: np.ndarray,            # (D,) 全量数据均值（z-score 参数）
-    col_std: np.ndarray,             # (D,) 全量数据标准差（z-score 参数）
-    weight_sqrt: np.ndarray,         # (D,) √w 加权向量
+    sim_feature_cols: list[str],     # 特征列名
+    sim_threshold: float,            # 柯西核相似度阈值 S=1/(1+d²)
+    slide_step: int,                 # 滑窗步长
+    M: np.ndarray,                   # (D, D) 加权协方差逆矩阵
     verbose: bool = True,
 ) -> list[int]:
     """
-    cos 相似度预筛：在负荷初筛通过的片段上，等长滑窗 + z-score 标准化（全量统计量）+ √w 加权 + 逐点 cos。
+    马氏距离预筛：在负荷初筛通过的片段上，等长滑窗 + 逐点马氏距离 + 柯西核相似度均值。
 
-    向量化实现：整个片段一次性标准化，所有滑窗的逐点 cos 用矩阵运算批量计算。
+    向量化实现：整个片段一次性计算 (T_q, seg_len) 逐点马氏距离矩阵，
+    所有滑窗只需取对角线均值（O(T_q) per window）。
 
     参数：
-        query_matrix: (T_q, D) 查询序列（原始值，内部做标准化+加权）
+        query_matrix: (T_q, D) 查询序列（原始特征）
         ref_window: 参考窗口 DataFrame
         segments: 负荷初筛通过的片段 [(start, end), ...]
         sim_feature_cols: 特征列名列表
-        cos_threshold: cos 相似度阈值，低于此值的窗口删掉
-        cos_slide_step: 滑窗步长（分钟）
-        col_mean: (D,) 全量数据均值
-        col_std: (D,) 全量数据标准差
-        weight_sqrt: (D,) √w 加权向量
+        sim_threshold: 柯西核相似度阈值，低于此值的窗口删掉
+        slide_step: 滑窗步长（分钟）
+        M: (D, D) 加权协方差逆矩阵
         verbose: 是否打印进度
 
     返回：
-        通过 cos 筛选的窗口起点索引列表（基于 ref_window 的行索引）
+        通过马氏距离筛选的窗口起点索引列表（基于 ref_window 的行索引）
     """
     T_q, D = query_matrix.shape
 
-    # 1. 查询序列 z-score 标准化 + 加权 + 预计算范数
-    query_zw = ((query_matrix - col_mean) / col_std) * weight_sqrt  # (T_q, D)
-    q_norm = np.linalg.norm(query_zw, axis=1)  # (T_q,)
-    q_norm_safe = np.where(q_norm < 1e-12, 1e-12, q_norm)
-    query_unit = query_zw / q_norm_safe[:, None]  # (T_q, D) 单位向量
+    # 1. 预计算查询序列的 Mq 和 qMq（对所有片段复用）
+    Mq = M @ query_matrix.T                    # (D, T_q)
+    qMq = np.sum(query_matrix.T * Mq, axis=0)  # (T_q,) qᵀMq
 
-    # 2. 在每个片段内批量计算所有滑窗的逐点 cos
+    # 2. 在每个片段内批量计算所有滑窗的逐点马氏距离
     passed_starts: list[int] = []
     n_checked = 0
     n_passed = 0
@@ -358,40 +366,37 @@ def cos_prefilter(
         if seg_len < T_q:
             continue
 
-        # 提取片段特征矩阵
+        # 提取片段特征矩阵（原始特征）
         seg_features = ref_window[sim_feature_cols].iloc[seg_start:seg_end].values.astype(float)
-        # 填充 NaN
-        if np.isnan(seg_features).any():
-            inds = np.where(np.isnan(seg_features))
-            seg_features[inds] = np.take(col_mean, inds[1])
+        # 填充 NaN 为 0（马氏距离用）
+        seg_features = np.nan_to_num(seg_features, nan=0.0)
 
-        # z-score 标准化 + 加权（整个片段一次性）
-        seg_zw = ((seg_features - col_mean) / col_std) * weight_sqrt  # (seg_len, D)
-        # 预计算每个时间点的范数
-        seg_norm = np.linalg.norm(seg_zw, axis=1)  # (seg_len,)
-        seg_norm_safe = np.where(seg_norm < 1e-12, 1e-12, seg_norm)
-        seg_unit = seg_zw / seg_norm_safe[:, None]  # (seg_len, D) 单位向量
+        # 向量化逐点马氏距离矩阵 (T_q, seg_len)
+        # d²[i,j] = qMq[i] - 2 qMx[i,j] + xMx[j]
+        Mx = M @ seg_features.T                          # (D, seg_len)
+        xMx = np.sum(seg_features.T * Mx, axis=0)        # (seg_len,) xᵀMx
+        qMx = query_matrix @ Mx                           # (T_q, seg_len) qᵀMx
+        d_sq = qMq[:, None] - 2.0 * qMx + xMx[None, :]    # (T_q, seg_len)
+        d_sq = np.maximum(d_sq, 0.0)                      # 数值保护
 
-        # 批量计算所有滑窗的逐点 cos
-        # query_unit: (T_q, D), seg_unit: (seg_len, D)
-        # 逐点 cos 矩阵: (T_q, seg_len) = query_unit @ seg_unit.T
-        cos_pt = query_unit @ seg_unit.T  # (T_q, seg_len) ∈ [-1, 1]
+        # 柯西核相似度矩阵 (T_q, seg_len)
+        sim_matrix = 1.0 / (1.0 + d_sq)  # S=1/(1+d²) ∈ (0, 1]
 
-        # 滑窗：每个窗口 cos 均值 = mean over t of cos_pt[t, win_start+t]
+        # 滑窗：每个窗口取对角线均值
         n_windows = seg_len - T_q + 1
-        for win_start in range(0, n_windows, cos_slide_step):
-            # 提取对角线 cos 值：cos_pt[t, win_start + t] for t in range(T_q)
+        for win_start in range(0, n_windows, slide_step):
+            # 对角线元素 sim_matrix[t, win_start+t] for t in range(T_q)
             diag_idx = np.arange(T_q) + win_start
-            cos_vals = cos_pt[np.arange(T_q), diag_idx]  # (T_q,)
-            cos_mean = float(np.mean(cos_vals))
+            sim_vals = sim_matrix[np.arange(T_q), diag_idx]  # (T_q,)
+            sim_mean = float(np.mean(sim_vals))
 
             n_checked += 1
-            if cos_mean >= cos_threshold:
+            if sim_mean >= sim_threshold:
                 passed_starts.append(seg_start + win_start)
                 n_passed += 1
 
     if verbose:
-        print(f"[DTW] cos 预筛: 检查 {n_checked} 个窗口，通过 {n_passed} 个（阈值 {cos_threshold}）")
+        print(f"[DTW] 马氏距离预筛: 检查 {n_checked} 个窗口，通过 {n_passed} 个（阈值 {sim_threshold}）")
 
     return passed_starts
 
@@ -406,14 +411,14 @@ def _dtw_process_one(args: tuple) -> dict:
     模块级 worker 函数，供 ThreadPoolExecutor/ProcessPoolExecutor 调用。
     参数通过 tuple 传递以支持 pickle 序列化。
     """
-    query_matrix, cand_matrix, min_coverage, sakoe_chiba_w = args
-    aligned_pairs, path_cost, coverage_ok, cos_matrix = dtw_align_with_coverage_cos(
-        query_matrix, cand_matrix, min_coverage=min_coverage, sakoe_chiba_w=sakoe_chiba_w
+    query_matrix, cand_matrix, M, min_coverage, sakoe_chiba_w = args
+    aligned_pairs, path_cost, coverage_ok, dist_matrix = dtw_align_with_coverage_mahalanobis(
+        query_matrix, cand_matrix, M=M, min_coverage=min_coverage, sakoe_chiba_w=sakoe_chiba_w
     )
     if not coverage_ok:
         sim = 0.0
     else:
-        sim = dtw_cos_mean(cos_matrix, aligned_pairs)
+        sim = dtw_mahalanobis_mean(dist_matrix, aligned_pairs)
     return {
         "sim": sim,
         "path_cost": path_cost,
@@ -425,19 +430,21 @@ def _dtw_process_one(args: tuple) -> dict:
 def _parallel_dtw_align(
     query_matrix: np.ndarray,
     candidates: list[dict],
+    M: np.ndarray,
     min_coverage: int,
     sakoe_chiba_w: int = 0,
     n_workers: int = 4,
 ) -> list[dict]:
     """
-    并行计算多个候选的 DTW 对齐 + cos 相似度。
+    并行计算多个候选的 DTW 对齐 + 马氏距离相似度。
 
     使用 ThreadPoolExecutor，配合 numpy 矩阵运算释放 GIL 可部分并行。
     相比 ProcessPool 无 pickle 序列化开销，适合小任务。
 
     参数：
-        query_matrix: (T_q, D) 查询序列（已标准化+加权）
-        candidates: 候选列表，每个含 "matrix" 字段（已标准化+加权）
+        query_matrix: (T_q, D) 查询序列（原始特征）
+        candidates: 候选列表，每个含 "matrix" 字段（原始特征）
+        M: (D, D) 加权协方差逆矩阵
         min_coverage: 最小覆盖帧数
         sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束，>=1 限制 |i-j|<=w）
         n_workers: 并行线程数
@@ -448,7 +455,7 @@ def _parallel_dtw_align(
     from concurrent.futures import ThreadPoolExecutor
 
     args_list = [
-        (query_matrix, cand["matrix"], min_coverage, sakoe_chiba_w)
+        (query_matrix, cand["matrix"], M, min_coverage, sakoe_chiba_w)
         for cand in candidates
     ]
 
@@ -473,23 +480,21 @@ def query_dtw(
     ref_df_resid: pd.DataFrame,
     feat: Any,
     dtw_cfg: DTWQueryConfig,
-    norm_mean: np.ndarray | None = None,
-    norm_std: np.ndarray | None = None,
-    weight_sqrt: np.ndarray | None = None,
+    cov_inv_matrix: np.ndarray | None = None,
     time_col: str | None = None,
     alias_map: dict[str, str] | None = None,
     verbose: bool = True,
     n_workers: int = 4,
 ) -> PlanResult:
     """
-    DTW 时序查询主函数（加权 cos 相似度）。
+    DTW 时序查询主函数（加权马氏距离 + 柯西核）。
 
     流程：
         1. 解析查询时间戳，定位 ref_df 中的行号
         2. 截取参考窗口（t - ref_days天 ~ t）
-        3. 接收标准化参数（norm_mean/norm_std/weight_sqrt）
+        3. 接收加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
         4. 提取查询序列（ref_window 末尾 query_seq_len 个点）和候选序列（dtw_max_len min 滑窗）
-        5. DTW 对齐（cos 距离代价）+ cos 相似度均值 → 序列相似度
+        5. DTW 对齐（马氏距离代价）+ 柯西核相似度均值 → 序列相似度
         6. Top-k 排序
         7. 生成规划中心
 
@@ -498,9 +503,7 @@ def query_dtw(
         ref_df_resid: 带残差特征的参考 DataFrame（分钟级，时间有序）
         feat: FeatureConfig
         dtw_cfg: DTWQueryConfig
-        norm_mean: (D,) 全量数据均值（z-score 参数，从 dtw_norm_stats.json 加载）
-        norm_std: (D,) 全量数据标准差
-        weight_sqrt: (D,) √w 加权向量
+        cov_inv_matrix: (D, D) 加权协方差逆矩阵 M（从 covariance.json 加载）
         time_col: 时间列名（None=自动识别）
         alias_map: 列名别名映射
         verbose: 是否打印进度
@@ -546,19 +549,17 @@ def query_dtw(
             f"({dtw_cfg.dtw_max_len}) + 查询序列 ({dtw_cfg.query_seq_len})"
         )
 
-    # ---- 3. 标准化参数（z-score + √w 加权，从 dtw_norm_stats.json 加载）----
+    # ---- 3. 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）----
     all_feature_cols = feat.raw_features + [f"resid_{t}" for t in feat.residual_targets]
     sim_feature_cols = list(dict.fromkeys(all_feature_cols))  # 去重保序
 
-    if norm_mean is None or norm_std is None or weight_sqrt is None:
-        raise ValueError("DTW cos 相似度需要 norm_mean/norm_std/weight_sqrt，请先运行 compute_dtw_norm_stats.py 生成 dtw_norm_stats.json")
+    if cov_inv_matrix is None:
+        raise ValueError("DTW 马氏距离需要 cov_inv_matrix，请先运行 train_residual.py 生成 covariance.json")
 
-    col_mean = np.asarray(norm_mean, dtype=float)
-    col_std = np.asarray(norm_std, dtype=float)
-    w_sqrt = np.asarray(weight_sqrt, dtype=float)
+    M = np.asarray(cov_inv_matrix, dtype=float)
 
     if verbose:
-        print(f"[DTW] 特征数: {len(sim_feature_cols)}，cos 加权（√w 非零维度: {int(np.sum(w_sqrt > 1e-12))}）")
+        print(f"[DTW] 特征数: {len(sim_feature_cols)}，M 矩阵 shape: {M.shape}")
 
     # ---- 4. 提取查询序列（ref_window 末尾 query_seq_len 个点）----
     # 查询序列 = ref_window 末尾 query_seq_len 个点（不含 query_ts，已由 <= 条件排除）
@@ -572,17 +573,8 @@ def query_dtw(
 
     query_matrix = query_df[sim_feature_cols].values.astype(float)  # (T_q, D)
 
-    # ---- 4.5 填充 NaN 值 + 标准化 + 加权 ----
-    # 某些列（如 吨煤产气量）可能有 NaN，用全量均值填充
-    for i in range(query_matrix.shape[1]):
-        if np.isnan(query_matrix[:, i]).any():
-            if pd.notna(col_mean[i]):
-                query_matrix[np.isnan(query_matrix[:, i]), i] = col_mean[i]
-                if verbose:
-                    print(f"[DTW] 填充 NaN: {sim_feature_cols[i]} -> 均值 {col_mean[i]:.4f}")
-
-    # 标准化 + 加权
-    query_matrix = ((query_matrix - col_mean) / col_std) * w_sqrt  # (T_q, D)
+    # ---- 4.5 填充 NaN 值（用 0.0 填充，马氏距离用）----
+    query_matrix = np.nan_to_num(query_matrix, nan=0.0)
 
     # ---- 4.6 负荷初筛（主汽流量阈值筛选连续片段）----
     pre_cfg = dtw_cfg.prefilter
@@ -608,34 +600,23 @@ def query_dtw(
     else:
         segments = [(0, ref_n)]
 
-    # ---- 4.7 cos 相似度预筛 ----
-    # 注意：cos_prefilter 内部用原始 query_matrix 做标准化，故传入未标准化的副本
-    # query_matrix 此时已是标准化+加权后的，需要传原始值给 cos_prefilter
-    query_matrix_raw = query_df[sim_feature_cols].values.astype(float)
-    # 填充 NaN
-    for i in range(query_matrix_raw.shape[1]):
-        if np.isnan(query_matrix_raw[:, i]).any():
-            if pd.notna(col_mean[i]):
-                query_matrix_raw[np.isnan(query_matrix_raw[:, i]), i] = col_mean[i]
-
+    # ---- 4.7 马氏距离预筛 ----
     if pre_cfg.enable and segments != [(0, ref_n)]:
-        passed_starts = cos_prefilter(
-            query_matrix=query_matrix_raw,
+        passed_starts = mahalanobis_prefilter(
+            query_matrix=query_matrix,    # 原始特征（已 NaN→0）
             ref_window=ref_window,
             segments=segments,
             sim_feature_cols=sim_feature_cols,
-            cos_threshold=pre_cfg.cos_threshold,
-            cos_slide_step=pre_cfg.cos_slide_step,
-            col_mean=col_mean,
-            col_std=col_std,
-            weight_sqrt=w_sqrt,
+            sim_threshold=pre_cfg.sim_threshold,
+            slide_step=pre_cfg.slide_step,
+            M=M,
             verbose=verbose,
         )
 
         if not passed_starts:
-            # cos 预筛全部被筛掉，回退到负荷初筛结果（用片段起点）
+            # 马氏距离预筛全部被筛掉，回退到负荷初筛结果（用片段起点）
             if verbose:
-                print(f"[DTW] cos 预筛无通过窗口，回退到负荷初筛片段起点")
+                print(f"[DTW] 马氏距离预筛无通过窗口，回退到负荷初筛片段起点")
             passed_starts = [s for s, e in segments if e - s >= dtw_cfg.query_seq_len]
     else:
         # 无预筛模式：用 slide_step 生成全部起点
@@ -649,14 +630,9 @@ def query_dtw(
     # 候选窗口不得与查询序列重叠：要求 end <= ref_n - query_seq_len
     query_region_start = ref_n - dtw_cfg.query_seq_len
 
-    # 预计算整个 ref_window 的标准化+加权矩阵（一次性，候选直接切片复用）
+    # 预计算整个 ref_window 的原始特征矩阵（一次性，候选直接切片复用）
     ref_features = ref_window[sim_feature_cols].values.astype(float)  # (ref_n, D)
-    # 填充 NaN（用全量均值）
-    if np.isnan(ref_features).any():
-        inds = np.where(np.isnan(ref_features))
-        ref_features[inds] = np.take(col_mean, inds[1])
-    # z-score 标准化 + 加权
-    ref_zw = ((ref_features - col_mean) / col_std) * w_sqrt  # (ref_n, D)
+    ref_features = np.nan_to_num(ref_features, nan=0.0)
 
     # 候选窗口起点偏移量（ref_df_resid 中 t_start 之前的行数）
     global_offset = int((ref_df_resid[time_col] <= t_start).sum())
@@ -666,8 +642,8 @@ def query_dtw(
         if end > query_region_start:
             continue  # 排除与查询序列重叠的候选
 
-        # 直接从预计算的标准化矩阵切片（O(1)，无重复标准化）
-        mat = ref_zw[start:end]  # (cand_length, D)
+        # 直接从预计算的原始特征矩阵切片（O(1)）
+        mat = ref_features[start:end]  # (cand_length, D)
         global_start = global_offset + start
         candidates.append({
             "orig_start_idx": global_start,
@@ -681,14 +657,15 @@ def query_dtw(
         print(f"[DTW] 候选序列数: {total_cands} "
               f"（预筛通过 {len(passed_starts)} 起点 × 1 长度（{cand_length}min，DTW弹性对齐4~6））")
 
-    # ---- 6. DTW 对齐 + 覆盖帧检查 + cos 相似度均值（并行）----
+    # ---- 6. DTW 对齐 + 覆盖帧检查 + 马氏距离相似度均值（并行）----
     if verbose:
-        print(f"[DTW] DTW 对齐（cos 距离）+ cos 相似度计算中（{n_workers} 线程并行，Sakoe-Chiba w={dtw_cfg.sakoe_chiba_w}）...")
+        print(f"[DTW] DTW 对齐（马氏距离）+ 柯西核相似度计算中（{n_workers} 线程并行，Sakoe-Chiba w={dtw_cfg.sakoe_chiba_w}）...")
 
     # 并行计算
     dtw_results = _parallel_dtw_align(
         query_matrix=query_matrix,
         candidates=candidates,
+        M=M,
         min_coverage=dtw_cfg.min_coverage,
         sakoe_chiba_w=dtw_cfg.sakoe_chiba_w,
         n_workers=n_workers,
@@ -809,22 +786,19 @@ def query_dtw(
 @dataclass
 class DTWQueryEngine:
     """
-    DTW 时序查询引擎（加权 cos 相似度）。
+    DTW 时序查询引擎（加权马氏距离 + 柯西核）。
 
     持有：
         - cfg: PlanningConfig（含 DTWQueryConfig）
         - ref_df_resid: 带残差特征的分钟级参考 DataFrame
         - models: 残差模型字典
-        - norm_mean / norm_std: (D,) z-score 标准化参数（从 dtw_norm_stats.json 加载）
-        - weight_sqrt: (D,) √w 加权向量
+        - cov_inv_matrix: (D, D) 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
     """
 
     cfg: PlanningConfig
     ref_df_resid: pd.DataFrame | None = None
     models: dict[str, object] | None = None
-    norm_mean: np.ndarray | None = None
-    norm_std: np.ndarray | None = None
-    weight_sqrt: np.ndarray | None = None
+    cov_inv_matrix: np.ndarray | None = None
     n_workers: int = 4
     _cache_loaded: bool = field(default=False, init=False, repr=False)
 
@@ -856,33 +830,23 @@ class DTWQueryEngine:
         # 2. 加载残差模型
         self.models = load_residual_models(paths.residual_model_dir, feat.residual_targets)
 
-        # 3. 标准化参数（z-score，从 dtw_norm_stats.json 加载）
-        if paths.dtw_norm_stats_path and Path(paths.dtw_norm_stats_path).exists():
+        # 3. 加权协方差逆矩阵 M（从 covariance.json 加载，复用稳定工况路径）
+        if paths.covariance_path and Path(paths.covariance_path).exists():
             import json
-            with open(paths.dtw_norm_stats_path, "r", encoding="utf-8") as f:
-                norm_data = json.load(f)
-            sim_feature_cols = list(dict.fromkeys(
-                feat.raw_features + [f"resid_{t}" for t in feat.residual_targets]
-            ))
-            self.norm_mean = np.array([norm_data["mean"][c] for c in sim_feature_cols], dtype=float)
-            self.norm_std = np.array([norm_data["std"][c] for c in sim_feature_cols], dtype=float)
-            print(f"[DTW] 标准化参数已加载: {paths.dtw_norm_stats_path}，维度 {self.norm_mean.shape[0]}")
+            with open(paths.covariance_path, "r", encoding="utf-8") as f:
+                cov_data = json.load(f)
+            self.cov_inv_matrix = np.array(cov_data["cov_inv_matrix"], dtype=np.float64)
+            print(f"[DTW] M 矩阵已加载: {paths.covariance_path}，shape: {self.cov_inv_matrix.shape}")
         else:
             raise RuntimeError(
-                f"未找到标准化参数文件: {paths.dtw_norm_stats_path}，请先运行 compute_dtw_norm_stats.py 生成"
+                f"未找到协方差矩阵文件: {paths.covariance_path}，请先运行 train_residual.py 生成"
             )
-
-        # 4. √w 加权向量
-        weights = build_feature_weights(feat)
-        self.weight_sqrt = np.array([np.sqrt(max(weights.get(c, 0.0), 0.0)) for c in sim_feature_cols], dtype=float)
-        n_nonzero = int(np.sum(self.weight_sqrt > 1e-12))
-        print(f"[DTW] √w 加权向量已构建，非零维度: {n_nonzero}/{len(sim_feature_cols)}")
 
         self._cache_loaded = True
 
     def query_one(self, query_ts: str | pd.Timestamp, verbose: bool = True) -> PlanResult:
         """
-        单次 DTW 查询（加权 cos 相似度）。
+        单次 DTW 查询（加权马氏距离 + 柯西核）。
 
         参数：
             query_ts: 查询时间戳
@@ -901,9 +865,7 @@ class DTWQueryEngine:
             ref_df_resid=self.ref_df_resid,
             feat=self.cfg.features,
             dtw_cfg=self.cfg.dtw_query,
-            norm_mean=self.norm_mean,
-            norm_std=self.norm_std,
-            weight_sqrt=self.weight_sqrt,
+            cov_inv_matrix=self.cov_inv_matrix,
             time_col=self.cfg.time_col,
             alias_map=self.cfg.features.column_aliases,
             verbose=verbose,

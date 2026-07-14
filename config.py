@@ -77,7 +77,6 @@ class PathsConfig:
     covariance_path: str | None = None
     query_parquet: str | None = None
     cache_path: str | None = None
-    dtw_norm_stats_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,11 +157,11 @@ class OptimizeV2Config:
 
 @dataclass(frozen=True)
 class DTWPrefilterConfig:
-    """DTW 预筛配置（负荷初筛 + cos 相似度筛选）。"""
+    """DTW 预筛配置（负荷初筛 + 马氏距离相似度筛选）。"""
     enable: bool = True              # 是否启用预筛
     load_threshold: float = 15.0     # 负荷初筛阈值（t/h）
-    cos_threshold: float = 0.8       # cos 相似度筛选阈值
-    cos_slide_step: int = 1          # cos 预筛滑窗步长（分钟）
+    sim_threshold: float = 0.5       # 柯西核相似度阈值 S=1/(1+d²)
+    slide_step: int = 1              # 预筛滑窗步长（分钟）
 
 
 @dataclass(frozen=True)
@@ -292,7 +291,6 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
         covariance_path=paths_raw.get("covariance_path", None),
         query_parquet=paths_raw.get("query_parquet", None),
         cache_path=paths_raw.get("cache_path", None),
-        dtw_norm_stats_path=paths_raw.get("dtw_norm_stats_path", None),
     )
 
     # 解析 train 配置（可选）
@@ -399,8 +397,8 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
             prefilter=DTWPrefilterConfig(
                 enable=bool(dtw_raw.get("prefilter", {}).get("enable", True)),
                 load_threshold=float(dtw_raw.get("prefilter", {}).get("load_threshold", 15.0)),
-                cos_threshold=float(dtw_raw.get("prefilter", {}).get("cos_threshold", 0.8)),
-                cos_slide_step=int(dtw_raw.get("prefilter", {}).get("cos_slide_step", 1)),
+                sim_threshold=float(dtw_raw.get("prefilter", {}).get("sim_threshold", 0.5)),
+                slide_step=int(dtw_raw.get("prefilter", {}).get("slide_step", 1)),
             ),
             n_workers=int(dtw_raw.get("n_workers", 4)),
             sakoe_chiba_w=int(dtw_raw.get("sakoe_chiba_w", 1)),
