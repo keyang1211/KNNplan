@@ -50,15 +50,17 @@ from .batch import _resolve_time_col
 def dtw_align_cos(
     query_seq: np.ndarray,
     cand_seq: np.ndarray,
+    sakoe_chiba_w: int = 0,
 ) -> tuple[list[tuple[int, int]], float, np.ndarray]:
     """
-    标准 DTW 动态规划对齐（cos 距离代价）。
+    标准 DTW 动态规划对齐（cos 距离代价），支持 Sakoe-Chiba 带约束。
 
     输入序列需预先做 z-score 标准化 + √w 加权。
 
     参数：
         query_seq: (T_q, D) 查询序列（已标准化+加权）
         cand_seq: (T_c, D) 候选序列（已标准化+加权）
+        sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束全矩阵，>=1 限制 |i-j|<=w）
 
     返回：
         (aligned_pairs, path_cost, cos_matrix)
@@ -76,18 +78,34 @@ def dtw_align_cos(
     D = np.full((n, m), np.inf, dtype=float)
     D[0, 0] = dist_matrix[0, 0]
 
-    # 首行
-    for j in range(1, m):
-        D[0, j] = D[0, j - 1] + dist_matrix[0, j]
-
-    # 首列
-    for i in range(1, n):
-        D[i, 0] = D[i - 1, 0] + dist_matrix[i, 0]
-
-    # 内点
-    for i in range(1, n):
+    if sakoe_chiba_w <= 0:
+        # 无约束（全矩阵）
+        # 首行
         for j in range(1, m):
-            D[i, j] = dist_matrix[i, j] + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+            D[0, j] = D[0, j - 1] + dist_matrix[0, j]
+        # 首列
+        for i in range(1, n):
+            D[i, 0] = D[i - 1, 0] + dist_matrix[i, 0]
+        # 内点
+        for i in range(1, n):
+            for j in range(1, m):
+                D[i, j] = dist_matrix[i, j] + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
+    else:
+        # Sakoe-Chiba 带约束：只计算 |i-j| <= w 的单元
+        # 安全保护：w 至少为 |n-m|，确保终点 (n-1, m-1) 可达
+        w = max(sakoe_chiba_w, abs(n - m))
+        # 首行：j ∈ [1, w]（|0-j|<=w → j<=w）
+        for j in range(1, min(w + 1, m)):
+            D[0, j] = D[0, j - 1] + dist_matrix[0, j]
+        # 首列：i ∈ [1, w]
+        for i in range(1, min(w + 1, n)):
+            D[i, 0] = D[i - 1, 0] + dist_matrix[i, 0]
+        # 内点：j ∈ [max(1, i-w), min(m, i+w+1)]
+        for i in range(1, n):
+            j_start = max(1, i - w)
+            j_end = min(m, i + w + 1)
+            for j in range(j_start, j_end):
+                D[i, j] = dist_matrix[i, j] + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
 
     # 路径回溯
     aligned_pairs: list[tuple[int, int]] = []
@@ -118,6 +136,7 @@ def dtw_align_with_coverage_cos(
     query_seq: np.ndarray,
     cand_seq: np.ndarray,
     min_coverage: int = 4,
+    sakoe_chiba_w: int = 0,
 ) -> tuple[list[tuple[int, int]], float, bool, np.ndarray]:
     """
     DTW 对齐 + 候选覆盖帧检查（cos 距离代价）。
@@ -128,11 +147,12 @@ def dtw_align_with_coverage_cos(
         query_seq: (T_q, D) 查询序列（已标准化+加权）
         cand_seq: (T_c, D) 候选序列（已标准化+加权）
         min_coverage: 最少不重复候选帧数（默认 4）
+        sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束，>=1 限制 |i-j|<=w）
 
     返回：
         (aligned_pairs, path_cost, coverage_ok, cos_matrix)
     """
-    aligned_pairs, path_cost, cos_matrix = dtw_align_cos(query_seq, cand_seq)
+    aligned_pairs, path_cost, cos_matrix = dtw_align_cos(query_seq, cand_seq, sakoe_chiba_w=sakoe_chiba_w)
     # 计算路径覆盖的不重复候选帧数
     cand_indices = np.array([j for _, j in aligned_pairs])
     n_unique = int(np.unique(cand_indices).size)
@@ -386,9 +406,9 @@ def _dtw_process_one(args: tuple) -> dict:
     模块级 worker 函数，供 ThreadPoolExecutor/ProcessPoolExecutor 调用。
     参数通过 tuple 传递以支持 pickle 序列化。
     """
-    query_matrix, cand_matrix, min_coverage = args
+    query_matrix, cand_matrix, min_coverage, sakoe_chiba_w = args
     aligned_pairs, path_cost, coverage_ok, cos_matrix = dtw_align_with_coverage_cos(
-        query_matrix, cand_matrix, min_coverage=min_coverage
+        query_matrix, cand_matrix, min_coverage=min_coverage, sakoe_chiba_w=sakoe_chiba_w
     )
     if not coverage_ok:
         sim = 0.0
@@ -406,6 +426,7 @@ def _parallel_dtw_align(
     query_matrix: np.ndarray,
     candidates: list[dict],
     min_coverage: int,
+    sakoe_chiba_w: int = 0,
     n_workers: int = 4,
 ) -> list[dict]:
     """
@@ -418,6 +439,7 @@ def _parallel_dtw_align(
         query_matrix: (T_q, D) 查询序列（已标准化+加权）
         candidates: 候选列表，每个含 "matrix" 字段（已标准化+加权）
         min_coverage: 最小覆盖帧数
+        sakoe_chiba_w: Sakoe-Chiba 带宽（0=无约束，>=1 限制 |i-j|<=w）
         n_workers: 并行线程数
 
     返回：
@@ -426,7 +448,7 @@ def _parallel_dtw_align(
     from concurrent.futures import ThreadPoolExecutor
 
     args_list = [
-        (query_matrix, cand["matrix"], min_coverage)
+        (query_matrix, cand["matrix"], min_coverage, sakoe_chiba_w)
         for cand in candidates
     ]
 
@@ -661,13 +683,14 @@ def query_dtw(
 
     # ---- 6. DTW 对齐 + 覆盖帧检查 + cos 相似度均值（并行）----
     if verbose:
-        print(f"[DTW] DTW 对齐（cos 距离）+ cos 相似度计算中（{n_workers} 线程并行）...")
+        print(f"[DTW] DTW 对齐（cos 距离）+ cos 相似度计算中（{n_workers} 线程并行，Sakoe-Chiba w={dtw_cfg.sakoe_chiba_w}）...")
 
     # 并行计算
     dtw_results = _parallel_dtw_align(
         query_matrix=query_matrix,
         candidates=candidates,
-        min_coverage=dtw_cfg.dtw_min_len,
+        min_coverage=dtw_cfg.min_coverage,
+        sakoe_chiba_w=dtw_cfg.sakoe_chiba_w,
         n_workers=n_workers,
     )
 

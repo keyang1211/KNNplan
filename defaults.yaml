@@ -207,8 +207,18 @@ dtw_query:
     cos_slide_step: 1         # cos 预筛滑窗步长（分钟）
 
   # 并行计算配置
-  # 单次查询内部 DTW 并行线程数（Numba JIT 释放 GIL，可真正并行）
+  # 单次查询内部 DTW 并行线程数（numpy 运算释放 GIL，可部分并行）
   n_workers: 4
+
+  # Sakoe-Chiba 带约束：限制 DP 只计算 |i-j| <= w 的单元
+  # w=0 表示无约束（全矩阵），w=1 时减少约 50% 计算量
+  # 约束：w >= |query_seq_len - dtw_max_len|（否则终点不可达）
+  # 当前 query_seq_len=5, dtw_max_len=6，|5-6|=1，故 w 最小为 1
+  sakoe_chiba_w: 2
+
+  # DTW 路径最少不重复候选帧数（用于过滤对齐质量差的候选）
+  # 路径中不重复候选帧数 < 此值的候选，相似度置 0
+  min_coverage: 4
 
 # =============================================
 # 权重寻优配置（数值梯度下降）

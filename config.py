@@ -177,7 +177,9 @@ class DTWQueryConfig:
     resid_cache_parquet: str   # 残差缓存 parquet 路径
     dtw_feature_weights: dict[str, float]  # DTW 距离权重（欧氏距离中各特征权重）
     prefilter: DTWPrefilterConfig = field(default_factory=DTWPrefilterConfig)
-    n_workers: int = 4             # 单次查询内部 DTW 并行线程数（Numba JIT 释放 GIL）
+    n_workers: int = 4             # 单次查询内部 DTW 并行线程数（numpy 释放 GIL）
+    sakoe_chiba_w: int = 1         # Sakoe-Chiba 带宽（0=无约束，>=1 限制 |i-j|<=w）
+    min_coverage: int = 4          # DTW 路径最少不重复候选帧数（独立于 dtw_min_len）
 
 
 @dataclass(frozen=True)
@@ -401,6 +403,8 @@ def load_config(yaml_path: str | Path = None, override: dict[str, Any] = None) -
                 cos_slide_step=int(dtw_raw.get("prefilter", {}).get("cos_slide_step", 1)),
             ),
             n_workers=int(dtw_raw.get("n_workers", 4)),
+            sakoe_chiba_w=int(dtw_raw.get("sakoe_chiba_w", 1)),
+            min_coverage=int(dtw_raw.get("min_coverage", 4)),
         )
 
     return PlanningConfig(
